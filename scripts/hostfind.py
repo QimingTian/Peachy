@@ -14,7 +14,9 @@ Set REACHY_QUIET=1 to silence the one-line stderr note.
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 import sys
 import urllib.request
 from pathlib import Path
@@ -43,6 +45,21 @@ def _answers(host: str, port: int, timeout: float = 1.5) -> bool:
         return True            # 503 etc. — daemon is there, just unhappy
     except Exception:
         return False           # refused / timeout / DNS — not here
+
+
+def _pin_ip(host: str, port: int) -> str:
+    """mDNS names (reachy-mini.local) resolve slowly and flakily on a busy LAN;
+    cache the address they currently point at instead."""
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError:
+        return host
+    return ip if _answers(ip, port) else host
 
 
 def _note(msg: str) -> None:
@@ -77,6 +94,7 @@ def resolve_host() -> str:
 
     for h in order:
         if _answers(h, port):
+            h = _pin_ip(h, port)
             _resolved = h
             try:
                 _CACHE.parent.mkdir(parents=True, exist_ok=True)

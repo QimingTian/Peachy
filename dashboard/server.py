@@ -65,111 +65,17 @@ _load_reachy_env()
 
 sys.path.insert(0, str(_SCRIPTS))
 from hostfind import resolve_host  # noqa: E402
+import heading  # noqa: E402
 
 HOST = os.environ.get("REACHY_HOST") or resolve_host()
 PORT = int(os.environ.get("REACHY_PORT", "8000"))
 
-_CONFIRM_LOG = _RUN / "light_confirmations.jsonl"
-_REANCHOR_FILE = _RUN / "light_reanchor.json"
-_RW_PID = _RUN / "dashboard_roomwatch.pid"
-_RW_LOG = _RUN / "dashboard_roomwatch.log"
-_CONVO_PID = _RUN / "conversation_app.pid"
 _CONVO_SH = _SCRIPTS / "app-conversation.sh"
 _STATE_FILE = _RUN / "reachy_toggle_state.json"
 _VOLUME_FILE = _RUN / "speaker_volume.json"
 _DEFAULT_VOLUME = 100
 _DEFAULT_CONVO_VOICE = "ballad"
 _volume_boot_done = False
-
-# Persistent light sensor — hysteresis (ema/ref/lit) must survive between HTTP polls.
-_LIGHT_SENSOR = None
-_LIGHT_SENSOR_LOCK = threading.Lock()
-_LIGHT_HISTORY: deque[dict] = deque(maxlen=360)
-
-
-def _light_payload_from_watcher(watcher: dict, on_d: float, off_d: float) -> dict:
-    """Build status light dict from watch-room log line (same sensor as the state machine)."""
-    ref = float(watcher.get("ref") or 0)
-    ema = float(watcher.get("ema") or 0)
-    delta = float(watcher.get("delta") if watcher.get("delta") is not None else ema - ref)
-    lit = bool(watcher.get("lit"))
-    would_lit = ema >= ref + on_d
-    would_dark = ema <= ref + off_d
-    entry = {
-        "t": time.time(),
-        "ts": watcher.get("t") or time.strftime("%H:%M:%S"),
-        "raw": watcher.get("raw"),
-        "ema": ema,
-        "ref": ref,
-        "delta": delta,
-        "lit": lit,
-        "would_lit": would_lit,
-        "on_threshold": round(ref + on_d, 1),
-        "off_threshold": round(ref + off_d, 1),
-    }
-    if not _LIGHT_HISTORY or _LIGHT_HISTORY[-1].get("ts") != entry["ts"]:
-        _LIGHT_HISTORY.append(entry)
-    return {
-        "ok": True,
-        "raw": watcher.get("raw"),
-        "ema": ema,
-        "ref": ref,
-        "delta": delta,
-        "lit": lit,
-        "would_lit": would_lit,
-        "would_dark": would_dark,
-        "motion": watcher.get("motion"),
-        "on_threshold": entry["on_threshold"],
-        "off_threshold": entry["off_threshold"],
-        "source": "roomwatch_log",
-    }
-
-
-def _reset_dashboard_light_sensor() -> None:
-    global _LIGHT_SENSOR
-    with _LIGHT_SENSOR_LOCK:
-        _LIGHT_SENSOR = None
-
-
-def _dashboard_light_read() -> dict:
-    global _LIGHT_SENSOR
-    sys.path.insert(0, str(_SCRIPTS))
-    from light_lab import effective_off_delta, effective_on_delta
-
-    with _LIGHT_SENSOR_LOCK:
-        if _LIGHT_SENSOR is None:
-            from light_sensor import LightSensor
-            _LIGHT_SENSOR = LightSensor()
-        sensor = _LIGHT_SENSOR
-        sensor.read()
-        sensor.lit(fresh=False)
-        snap = sensor.snapshot()
-    on_d = effective_on_delta()
-    off_d = effective_off_delta()
-    ref = float(snap.get("ref") or 0)
-    ema = float(snap.get("ema") or 0)
-    would_lit = ema >= ref + on_d
-    would_dark = ema <= ref + off_d
-    entry = {
-        "t": time.time(),
-        "ts": time.strftime("%H:%M:%S"),
-        "raw": snap.get("raw"),
-        "ema": ema,
-        "ref": ref,
-        "delta": snap.get("delta"),
-        "lit": bool(snap.get("lit")),
-        "would_lit": would_lit,
-        "on_threshold": round(ref + on_d, 1),
-        "off_threshold": round(ref + off_d, 1),
-    }
-    _LIGHT_HISTORY.append(entry)
-    return {
-        **snap,
-        "would_lit": would_lit,
-        "would_dark": would_dark,
-        "on_threshold": entry["on_threshold"],
-        "off_threshold": entry["off_threshold"],
-    }
 
 _HEAD_AXES = ("x", "y", "z", "roll", "pitch", "yaw")
 _LIM_PR = math.radians(38.0)
@@ -250,16 +156,56 @@ def _run_script(args: list[str], timeout: float = 140.0) -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 
+# Read-only daemon queries that every console tab and sense-live poll. Shared so
+# the robot sees at most one request per path per second however many clients
+# are open; concurrent callers wait for the one request in flight. Failures are
+# cached too, so an offline robot doesn't queue up timeouts.
+_SHARED_TTL = 1.0
+_SHARED_PATHS = ("/api/state/full", "/api/apps/current-app-status",
+                 "/api/state/present_body_yaw", "/api/move/running")
+_shared: dict[str, tuple[float, object, BaseException | None]] = {}
+_shared_lock = threading.Lock()
+_shared_flight = {p: threading.Lock() for p in _SHARED_PATHS}
+
+
+def _daemon_get(path: str, timeout: float = 4.0):
+    def hit():
+        c = _shared.get(path)
+        return c if c and time.monotonic() - c[0] < _SHARED_TTL else None
+
+    with _shared_flight[path]:
+        c = hit()
+        if c is None:
+            try:
+                c = (time.monotonic(), _daemon_json(path, timeout=timeout), None)
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError,
+                    ValueError) as e:
+                c = (time.monotonic(), None, e)
+            with _shared_lock:
+                _shared[path] = c
+    if c[2] is not None:
+        raise c[2]
+    return c[1]
+
+
+def _shared_forget(*paths: str) -> None:
+    with _shared_lock:
+        for p in paths or tuple(_shared):
+            _shared.pop(p, None)
+
+
 def _daemon_up() -> bool:
     try:
-        urllib.request.urlopen(f"http://{HOST}:{PORT}/api/state/full", timeout=3)
+        _daemon_get("/api/state/full", timeout=3)
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
 def _daemon_json(path: str, method: str = "GET", body: dict | None = None,
                  timeout: float = 12.0) -> dict:
+    if method != "GET":
+        _shared_forget()
     url = f"http://{HOST}:{PORT}{path}"
     data = json.dumps(body).encode() if body is not None else (b"{}" if method == "POST" else None)
     req = urllib.request.Request(url, method=method, data=data)
@@ -346,13 +292,37 @@ def _annotate_frame(payload: dict, path: Path) -> dict:
     return payload
 
 
+def _fetch_robot_jpeg(out: Path, quality: int = 85) -> bool:
+    """One camera frame over its own short-lived WebRTC stream."""
+    sys.path.insert(0, str(_SCRIPTS))
+    import cv2
+    from rtcmedia import RtcMedia
+
+    try:
+        m = RtcMedia(HOST, 1280, 720, fps=10, audio=False).start()
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        end = time.time() + 12
+        frame = None
+        while frame is None and time.time() < end and not m.error:
+            time.sleep(0.1)
+            frame = m.frame(max_age=2.0)
+        if frame is None:
+            return False
+        time.sleep(1.0)  # auto-exposure settles on the first frames
+        frame = m.frame(max_age=2.0)
+        if frame is None:
+            return False
+    finally:
+        m.stop()
+    return bool(cv2.imwrite(str(out), frame, [cv2.IMWRITE_JPEG_QUALITY, quality]))
+
+
 def _fetch_snap_frame(out: Path) -> dict:
     """Latest robot camera frame (WebRTC) written to *out*. No _robot_lock."""
-    sys.path.insert(0, str(_SCRIPTS))
-    from light_sensor import _fetch_robot_jpeg
-
     t0 = time.time()
-    if not _fetch_robot_jpeg(out, quality=85):
+    if not _fetch_robot_jpeg(out):
         return {"ok": False, "msg": "no camera frame (WebRTC stream unavailable)"}
     ms = int((time.time() - t0) * 1000)
     payload = {"ok": True, "msg": f"({ms} ms) {out.stat().st_size // 1024}KB",
@@ -364,9 +334,10 @@ def _release_robot_control() -> str:
     """Stop conversation / in-flight moves so wake-sleep owns the head."""
     notes: list[str] = []
     if _conversation_running():
-        subprocess.run([str(_CONVO_SH), "stop"], cwd=_REPO, env=_script_env(),
-                       capture_output=True, text=True, timeout=25)
+        _convo_sh("stop", 25)
         notes.append("conversation stopped")
+        if _hold_mode() != "free":
+            _motion({"mode": "free", "body_yaw": heading.enc_rad(0.0), "head_pitch": 0.0})
         time.sleep(1.8)
     try:
         _daemon_json("/api/move/stop", "POST", {}, timeout=6.0)
@@ -388,23 +359,18 @@ def _release_robot_control() -> str:
 
 
 def _stop_services(*, sleep: bool = False) -> tuple[bool, str]:
-    """Stop conversation, room watch, and in-flight moves."""
+    """Stop conversation, other apps and in-flight moves."""
     msgs: list[str] = []
     try:
         _daemon_json("/api/move/stop", "POST", {}, timeout=6.0)
         msgs.append("move halted")
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
         pass
-    if _roomwatch_running():
-        _stop_roomwatch()
-        msgs.append("room watch stopped")
     if _conversation_running():
-        subprocess.run([str(_CONVO_SH), "stop"], cwd=_REPO, env=_script_env(),
-                       capture_output=True, timeout=25)
+        _convo_sh("stop", 25)
         msgs.append("conversation stopped")
     else:
-        subprocess.run([str(_CONVO_SH), "stop"], cwd=_REPO, env=_script_env(),
-                       capture_output=True, timeout=25)
+        _convo_sh("stop", 25)
     cur = _current_app()
     if cur and cur.get("name") != _CONVO_APP_NAME and cur.get("state") in ("starting", "running"):
         try:
@@ -441,124 +407,18 @@ def _lan_ip() -> str:
         s.close()
 
 
-def _pid_alive(pidfile: Path) -> bool:
-    try:
-        os.kill(int(pidfile.read_text().strip()), 0)
-        return True
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
-        return False
-
-
-def _roomwatch_pid() -> int | None:
-    try:
-        pid = int(_RW_PID.read_text().strip())
-        os.kill(pid, 0)
-        return pid
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
-        return None
-
-
-def _roomwatch_cmdline(pid: int) -> str:
-    try:
-        p = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True, text=True, timeout=3,
-        )
-        return (p.stdout or "").strip()
-    except (subprocess.TimeoutExpired, OSError):
-        return ""
-
-
-def _roomwatch_log_age_s() -> float | None:
-    try:
-        if not _RW_LOG.is_file():
-            return None
-        return max(0.0, time.time() - _RW_LOG.stat().st_mtime)
-    except OSError:
-        return None
-
-
-def _roomwatch_running() -> bool:
-    pid = _roomwatch_pid()
-    if pid is None:
-        return False
-    if "watch-room.py" not in _roomwatch_cmdline(pid):
-        _RW_PID.unlink(missing_ok=True)
-        return False
-    return True
-
-
-def _roomwatch_healthy() -> bool:
-    """Watcher process alive and log line fresh (not a stale/orphan pid)."""
-    pid = _roomwatch_pid()
-    if pid is None:
-        return False
-    if "watch-room.py" not in _roomwatch_cmdline(pid):
-        return False
-    age = _roomwatch_log_age_s()
-    if age is None:
-        return False
-    try:
-        size = _RW_LOG.stat().st_size
-    except OSError:
-        size = 0
-    if size < 8:
-        return age < 20.0   # just started — log not flushed yet
-    return age < 45.0
-
-
-def _roomwatch_light_read(on_d: float, off_d: float) -> tuple[dict, str, dict, float | None]:
-    """Light telemetry for dashboard — prefer watcher log while it runs (one camera consumer)."""
-    log = _parse_roomwatch_log()
-    watcher = log.get("last") or {}
-    log_age = _roomwatch_log_age_s()
-    if _roomwatch_running() and watcher:
-        stale = log_age is None or log_age >= 45.0
-        light = _light_payload_from_watcher(watcher, on_d, off_d)
-        return light, ("roomwatch_stale" if stale else "roomwatch"), log, log_age
-    try:
-        light = {"ok": True, **_dashboard_light_read()}
-        return light, "dashboard", log, log_age
-    except OSError as e:
-        return {"ok": False, "msg": str(e)[-200:]}, "error", log, log_age
-
-
-def _stop_roomwatch() -> None:
-    pid = _roomwatch_pid()
-    if pid is not None:
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-    _RW_PID.unlink(missing_ok=True)
-
-
-def _start_roomwatch_proc() -> subprocess.Popen:
-    logf = open(_RW_LOG, "w", buffering=1)
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    if _sense_cfg()["wake"]:
-        env["REACHY_CONVO"] = "0"
-    return subprocess.Popen(
-        [sys.executable, "-u", str(_SCRIPTS / "watch-room.py")],
-        cwd=_REPO, stdout=logf, stderr=subprocess.STDOUT,
-        start_new_session=True, env=env,
-    )
-
-
 def _conversation_running() -> bool:
-    if _pid_alive(_CONVO_PID):
-        return True
+    cur = _current_app()
+    return bool(cur) and cur.get("name") == _CONVO_APP_NAME and \
+        cur.get("state") in ("starting", "running")
+
+
+def _convo_sh(cmd: str, timeout: float) -> subprocess.CompletedProcess:
     try:
-        p = subprocess.run(
-            [str(_CONVO_SH), "status"],
-            cwd=_REPO, env=_script_env(), capture_output=True, text=True, timeout=12,
-        )
-        return p.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+        return subprocess.run([str(_CONVO_SH), cmd], cwd=_REPO, env=_script_env(),
+                              capture_output=True, text=True, timeout=timeout)
+    finally:
+        _shared_forget("/api/apps/current-app-status")
 
 
 def _conversation_ui_url() -> str | None:
@@ -713,11 +573,12 @@ def index() -> FileResponse:
 @app.get("/api/status")
 def status() -> JSONResponse:
     up = _daemon_up()
+    state = _toggle_state()
     return JSONResponse({
         "daemon": up,
-        "state": _toggle_state(),                 # asleep | awake | unknown
-        "roomwatch": _roomwatch_running(),
-        "conversation": _conversation_running(),
+        "state": state,                           # asleep | semi | awake | unknown
+        # Dozing keeps the app warm but muted; the console treats it as off.
+        "conversation": state != "semi" and _conversation_running(),
         "gradio_url": _conversation_ui_url(),
         "busy": _robot_lock.locked(),
         "app": _current_app() if up else None,
@@ -759,12 +620,18 @@ def _action(name: str, args: list[str]) -> JSONResponse:
 
 @app.post("/api/do/{cmd}")
 def do(cmd: str) -> JSONResponse:
-    if cmd not in ("wake", "sleep", "toggle"):
+    if cmd not in ("wake", "sleep", "toggle", "semi"):
         raise HTTPException(404, "unknown command")
     if not _robot_lock.acquire(blocking=False):
         _logrec(cmd, False, "busy — concurrent action rejected")
         raise HTTPException(409, "Peachy is busy with another action — wait a sec")
     try:
+        if cmd == "semi":
+            t0 = time.time()
+            ok, msg = _enter_semi()
+            _last.update(action=cmd, ok=ok, msg=msg, at=time.time())
+            _logrec(cmd, ok, f"({time.time()-t0:.1f}s) {msg}")
+            return JSONResponse({"ok": ok, "msg": msg})
         released = _release_robot_control()
         t0 = time.time()
         ok, msg = _run_script([str(_SCRIPTS / "ctl-toggle.py"), cmd])
@@ -783,8 +650,8 @@ def head_status() -> JSONResponse:
     off = _head_offset()
     live: dict = {}
     try:
-        live = _daemon_json("/api/state/full").get("head_pose", {})
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        live = _daemon_get("/api/state/full").get("head_pose", {})
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
         pass
     ang = ("roll", "pitch", "yaw")
     return JSONResponse({
@@ -1031,108 +898,6 @@ def turret_sync() -> JSONResponse:
         return JSONResponse({"ok": False, "msg": msg})
 
 
-@app.get("/api/light")
-def light_status() -> JSONResponse:
-    """Peachy head-camera brightness (never the laptop webcam)."""
-    try:
-        data = {"ok": True, **_dashboard_light_read()}
-        data["roomwatch"] = _roomwatch_running()
-        return JSONResponse(data)
-    except OSError as e:
-        return JSONResponse({"ok": False, "msg": str(e)[-200:]})
-
-
-_LIGHT_LAB_IMAGES = {
-    "baseline": _RUN / "light_lab_baseline.jpg",
-    "sample": _RUN / "light_lab_sample.jpg",
-    "live": _RUN / "light_lab_live.jpg",
-    "baseline_annot": _RUN / "light_lab_baseline_annot.jpg",
-    "sample_annot": _RUN / "light_lab_sample_annot.jpg",
-    "live_annot": _RUN / "light_lab_live_annot.jpg",
-}
-
-
-@app.get("/api/light/lab")
-def light_lab_status() -> JSONResponse:
-    """Full light lab readout — ROIs, compare, tune, sensor."""
-    sys.path.insert(0, str(_SCRIPTS))
-    from light_lab import lab_status
-
-    try:
-        return JSONResponse(lab_status())
-    except OSError as e:
-        return JSONResponse({"ok": False, "msg": str(e)[-200:]})
-
-
-@app.post("/api/light/lab/capture/{label}")
-def light_lab_capture(label: str, note: str = Query("")) -> JSONResponse:
-    """Capture frame without waking (baseline/sample/live compare photos)."""
-    if label not in ("baseline", "sample", "live"):
-        raise HTTPException(404, "label must be baseline, sample, or live")
-    sys.path.insert(0, str(_SCRIPTS))
-    from light_lab import analyze_path, annotate, capture_frame, save_capture
-
-    try:
-        if label == "live":
-            dest = _RUN / "light_lab_live.jpg"
-            if not capture_frame(dest):
-                return JSONResponse({"ok": False, "msg": "camera read failed"})
-            annotate(dest, _RUN / "light_lab_live_annot.jpg")
-            data = analyze_path(dest)
-            return JSONResponse({"ok": True, "label": "live", **data})
-        data = save_capture(label, note or ("lights off" if label == "baseline" else "lights on"))
-        _logrec(f"light:capture:{label}", data.get("ok", False), note[:80])
-        return JSONResponse(data)
-    except OSError as e:
-        return JSONResponse({"ok": False, "msg": str(e)[-200:]})
-
-
-@app.get("/api/light/lab/compare")
-def light_lab_compare() -> JSONResponse:
-    sys.path.insert(0, str(_SCRIPTS))
-    from light_lab import compare_captures
-
-    return JSONResponse(compare_captures())
-
-
-@app.post("/api/light/lab/tune")
-async def light_lab_tune(request: Request) -> JSONResponse:
-    """Persist on/off deltas and preferred ROI to .run/light_tune.json."""
-    sys.path.insert(0, str(_SCRIPTS))
-    from light_lab import save_tune
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
-    kwargs: dict = {}
-    if "on_delta" in body:
-        kwargs["on_delta"] = max(3.0, min(80.0, float(body["on_delta"])))
-    if "off_delta" in body:
-        kwargs["off_delta"] = max(2.0, min(60.0, float(body["off_delta"])))
-    if "preferred_roi" in body:
-        from light_lab import ROIS
-
-        roi = str(body["preferred_roi"])
-        if roi in ROIS:
-            kwargs["preferred_roi"] = roi
-    if not kwargs:
-        return JSONResponse({"ok": False, "msg": "nothing to save"})
-    data = save_tune(**kwargs)
-    _logrec("light:tune", True, json.dumps(kwargs)[:120])
-    return JSONResponse({"ok": True, "tune": data})
-
-
-@app.get("/api/light/lab/image/{name}")
-def light_lab_image(name: str) -> FileResponse:
-    path = _LIGHT_LAB_IMAGES.get(name)
-    if not path or not path.is_file():
-        raise HTTPException(404, "image not found — capture first")
-    return FileResponse(path, media_type="image/jpeg")
-
-
 def _saved_volume() -> int:
     try:
         return max(0, min(100, int(json.loads(_VOLUME_FILE.read_text()).get("volume", _DEFAULT_VOLUME))))
@@ -1243,221 +1008,32 @@ def say_text(body: dict) -> JSONResponse:
     return JSONResponse({"ok": ok, "msg": msg})
 
 
-@app.post("/api/roomwatch/confirm")
-async def roomwatch_confirm(request: Request) -> JSONResponse:
-    """Teacher confirms ground-truth lights — logs sample + re-anchors ref when OFF."""
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001
-        body = {}
-    lights = str(body.get("lights", "")).strip().lower()
-    if lights not in ("on", "off"):
-        raise HTTPException(400, "lights must be 'on' or 'off'")
-
-    sys.path.insert(0, str(_SCRIPTS))
-    from light_lab import effective_off_delta, effective_on_delta
-    from light_sensor import schedule_reanchor
-
-    on_d = effective_on_delta()
-    off_d = effective_off_delta()
-    snap, _src, log, _log_age = _roomwatch_light_read(on_d, off_d)
-    watcher = log.get("last") or {}
-    if not snap.get("ok", True):
-        return JSONResponse({"ok": False, "msg": snap.get("msg", "light read failed")})
-
-    detected = bool(snap.get("lit"))
-    confirmed_on = lights == "on"
-    agree = detected == confirmed_on
-    ema = float(snap.get("ema") or 0)
-    ref = float(snap.get("ref") or 0)
-
-    rec = {
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "confirmed": lights,
-        "detected_lit": detected,
-        "agree": agree,
-        "ema": ema,
-        "ref": ref,
-        "delta": snap.get("delta"),
-        "raw": snap.get("raw"),
-        "watcher_state": watcher.get("state"),
-        "roomwatch": _roomwatch_running(),
-    }
-    _CONFIRM_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with _CONFIRM_LOG.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
-
-    msg_parts = [f"logged lights {lights.upper()}"]
-    if agree:
-        msg_parts.append("matches sensor")
-    else:
-        msg_parts.append(f"sensor said {'ON' if detected else 'OFF'} — correction recorded")
-
-    if lights == "off":
-        schedule_reanchor(ref=ema, ema=ema, lit=False)
-        _reset_dashboard_light_sensor()
-        msg_parts.append("re-anchored dark baseline")
-    elif lights == "on" and not agree:
-        schedule_reanchor(ref=max(0.0, ema - on_d), ema=ema, lit=True)
-        msg_parts.append("nudged ref for ON")
-
-    msg = " · ".join(msg_parts)
-    _logrec("roomwatch:confirm", True, msg)
-    return JSONResponse({"ok": True, "msg": msg, "agree": agree, "record": rec})
-
-
-@app.post("/api/roomwatch/{cmd}")
-def roomwatch(cmd: str) -> JSONResponse:
-    if cmd == "start":
-        if _roomwatch_running():
-            if _roomwatch_healthy():
-                _logrec("roomwatch:start", True, "already watching")
-                return JSONResponse({"ok": True, "msg": "already watching", "running": True})
-            _logrec("roomwatch:start", True, "restarting stale watcher")
-            _stop_roomwatch()
-        _reset_dashboard_light_sensor()
-        _LIGHT_HISTORY.clear()
-        proc = _start_roomwatch_proc()
-        _RW_PID.write_text(str(proc.pid))
-        time.sleep(1.0)
-        ok = _roomwatch_running()
-        msg = "room watch started" if ok else "failed — check dashboard_roomwatch.log (calibration?)"
-        _logrec("roomwatch:start", ok, msg)
-        return JSONResponse({"ok": ok, "msg": msg, "running": ok})
-    if cmd == "stop":
-        _stop_roomwatch()
-        _logrec("roomwatch:stop", True, "")
-        return JSONResponse({"ok": True, "msg": "room watch stopped", "running": False})
-    raise HTTPException(404, "unknown command")
-
-
-_RW_LOG_RE = __import__("re").compile(
-    r"^\[(\d{2}:\d{2}:\d{2})\] raw=([\d.+-]+) ema=([\d.+-]+) ref=([\d.+-]+) "
-    r"Δ=([+-]?[\d.]+) mot=([\d.+-]+) idle=([\d.+-]+)s lit=(\w+) speech=(\w+) "
-    r"state=(\w+|None)(?: pending=(\w+)\(([\d.]+)s\))?"
-)
-_RW_STATE_RE = __import__("re").compile(r"^\s*→ (\w+)")
-
-
-def _roomwatch_timing() -> dict:
-    return {
-        "poll_s": float(os.environ.get("REACHY_WATCH_PERIOD", "0.6")),
-        "settle_s": float(os.environ.get("REACHY_SETTLE_S", "3.0")),
-        "idle_sleep_s": float(os.environ.get("REACHY_IDLE_SLEEP_S", "300")),
-        "awake_hold_s": float(os.environ.get("REACHY_AWAKE_HOLD_S", "30")),
-    }
-
-
-def _parse_roomwatch_log() -> dict:
-    out: dict = {"lines": [], "last": None, "last_transition": None}
-    try:
-        text = _RW_LOG.read_text(errors="replace")
-    except OSError:
-        return out
-    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
-    out["lines"] = lines[-12:]
-    for ln in reversed(lines):
-        m = _RW_LOG_RE.match(ln)
-        if m:
-            out["last"] = {
-                "t": m.group(1),
-                "raw": float(m.group(2)),
-                "ema": float(m.group(3)),
-                "ref": float(m.group(4)),
-                "delta": float(m.group(5)),
-                "motion": float(m.group(6)),
-                "idle_s": float(m.group(7)),
-                "lit": m.group(8).lower() == "true",
-                "speech": m.group(9).lower() == "true",
-                "state": None if m.group(10) == "None" else m.group(10),
-                "pending": m.group(11),
-                "pending_s": float(m.group(12)) if m.group(12) else 0.0,
-            }
-            break
-    for ln in reversed(lines):
-        m = _RW_STATE_RE.match(ln)
-        if m:
-            out["last_transition"] = m.group(1)
-            break
-    return out
-
-
-@app.get("/api/roomwatch/status")
-def roomwatch_status() -> JSONResponse:
-    """Live room-watch telemetry — light sense, sensitivity, watcher log."""
-    sys.path.insert(0, str(_SCRIPTS))
-    from light_lab import effective_off_delta, effective_on_delta, load_tune, preferred_roi
-
-    tune = load_tune()
-    on_d = effective_on_delta()
-    off_d = effective_off_delta()
-    timing = _roomwatch_timing()
-    light, light_source, log, log_age = _roomwatch_light_read(on_d, off_d)
-    t0 = time.time()
-    watcher = log.get("last") or {}
-    poll_ms = int((time.time() - t0) * 1000)
-
-    ref = light.get("ref")
-    ema = light.get("ema")
-
-    return JSONResponse({
-        "ok": True,
-        "running": _roomwatch_running(),
-        "healthy": _roomwatch_healthy(),
-        "log_age_s": log_age,
-        "light_source": light_source,
-        "poll_ms": poll_ms,
-        "lit": bool(light.get("lit")),
-        "would_lit": bool(light.get("would_lit")),
-        "would_dark": bool(light.get("would_dark")),
-        "delta": light.get("delta"),
-        "ema": ema,
-        "ref": ref,
-        "raw": light.get("raw"),
-        "motion": light.get("motion"),
-        "on_threshold": light.get("on_threshold"),
-        "off_threshold": light.get("off_threshold"),
-        "speech": watcher.get("speech") if watcher else False,
-        "watcher_state": watcher.get("state"),
-        "pending": watcher.get("pending"),
-        "pending_s": watcher.get("pending_s"),
-        "last_transition": log.get("last_transition"),
-        "watcher_t": watcher.get("t"),
-        "sensitivity": {
-            "on_delta": on_d,
-            "off_delta": off_d,
-            "preferred_roi": preferred_roi(),
-            "on_threshold": light.get("on_threshold"),
-            "off_threshold": light.get("off_threshold"),
-            **timing,
-        },
-        "tune": tune,
-        "light": light,
-        "history": list(_LIGHT_HISTORY),
-        "log_tail": log.get("lines", []),
-        "conversation": _conversation_running(),
-    })
-
-
-@app.post("/api/roomwatch/history/clear")
-def roomwatch_history_clear() -> JSONResponse:
-    _LIGHT_HISTORY.clear()
-    _reset_dashboard_light_sensor()
-    return JSONResponse({"ok": True, "msg": "chart history cleared — sensor re-seeded"})
-
-
-def converse(cmd: str) -> JSONResponse:
-    """Start/stop the conversation app. Use ``end`` or ``/api/shutdown`` to sleep too."""
+def converse(cmd: str, keep_body: int = 0) -> JSONResponse:
+    """Start/stop the conversation app. Use ``end`` or ``/api/shutdown`` to sleep too.
+    From Dozing the body turns to face front unless ``keep_body`` (room watch found
+    someone where it is looking)."""
     if cmd == "start":
         if _conversation_running():
-            return JSONResponse({"ok": True, "msg": "already listening — talk to Peachy"})
+            if _hold_mode() == "free":
+                return JSONResponse({"ok": True, "msg": "already listening — talk to Peachy"})
+            if not _robot_lock.acquire(blocking=False):
+                raise HTTPException(409, "Peachy is busy — wait a sec")
+            try:
+                t0 = time.time()
+                ok, msg = _wake_from_semi(keep_body=bool(keep_body))
+                _last.update(action="converse:start", ok=ok, msg=msg, at=time.time())
+                _logrec("converse:start", ok, f"({time.time()-t0:.1f}s) {msg}")
+                return JSONResponse({"ok": ok, "msg": msg, "gradio_url": _conversation_ui_url()})
+            finally:
+                _robot_lock.release()
         if not _robot_lock.acquire(blocking=False):
             raise HTTPException(409, "Peachy is busy — wait a sec")
         try:
+            if _patch_installed() and _hold_mode() != "free":
+                _motion({"mode": "free"})
             released = _release_robot_control()
             wok, wmsg = _run_script([str(_SCRIPTS / "ctl-toggle.py"), "wake"], 90)
-            c = subprocess.run([str(_CONVO_SH), "start"], cwd=_REPO, env=_script_env(),
-                               capture_output=True, text=True, timeout=60)
+            c = _convo_sh("start", 60)
             ok = wok and _conversation_running()
             if ok:
                 msg = "listening — talk to Peachy"
@@ -1483,16 +1059,14 @@ def converse(cmd: str) -> JSONResponse:
         finally:
             _robot_lock.release()
     if cmd == "stop":
-        subprocess.run([str(_CONVO_SH), "stop"], cwd=_REPO, env=_script_env(),
-                       capture_output=True, text=True, timeout=25)
+        _convo_sh("stop", 25)
         ok = not _conversation_running()
         msg = "conversation stopped" if ok else "stop sent — check log"
         _last.update(action="converse:stop", ok=ok, msg=msg, at=time.time())
         _logrec("converse:stop", ok, msg)
         return JSONResponse({"ok": ok, "msg": msg})
     if cmd == "end":
-        subprocess.run([str(_CONVO_SH), "stop"], cwd=_REPO, env=_script_env(),
-                       capture_output=True, text=True, timeout=25)
+        _convo_sh("stop", 25)
         if not _robot_lock.acquire(blocking=False):
             raise HTTPException(409, "Peachy is busy — wait a sec")
         try:
@@ -1652,9 +1226,10 @@ def snap() -> JSONResponse:
 
 @app.post("/api/abort")
 def abort_action() -> JSONResponse:
-    """Emergency halt — stop moves and background apps; robot stays put."""
-    if _sense_cfg()["follow"]:
-        _sense_set(follow=False)
+    """Emergency halt — stop moves, background apps, Follow and room watch; robot stays put."""
+    cfg = _sense_cfg()
+    if cfg["follow"] or cfg["watch"]:
+        _sense_set(follow=False, watch=False)
     ok, m = _stop_services(sleep=False)
     _logrec("ABORT", ok, m)
     _last.update(action="abort", ok=ok, msg=m, at=time.time())
@@ -1669,7 +1244,7 @@ def shutdown_action() -> JSONResponse:
     try:
         t0 = time.time()
         if any(_sense_cfg().values()):
-            _sense_set(follow=False, wake=False)
+            _sense_set(follow=False, wake=False, watch=False)
         ok, m = _stop_services(sleep=True)
         _logrec("shutdown", ok, f"({time.time()-t0:.1f}s) {m}")
         _last.update(action="shutdown", ok=ok, msg=m, at=time.time())
@@ -1795,7 +1370,8 @@ def _motion(update: dict | None = None) -> dict | None:
         out = json.loads(p.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
         return None
-    _patch_seen.update(at=time.time(), installed=bool(out.get("installed")))
+    _patch_seen.update(at=time.time(), installed=bool(out.get("installed")),
+                       mode=(out.get("settings") or {}).get("mode", "free"))
     return out
 
 
@@ -1803,6 +1379,167 @@ def _patch_installed() -> bool:
     if time.time() - _patch_seen["at"] > 120 or _patch_seen["installed"] is None:
         _motion()
     return bool(_patch_seen["installed"])
+
+
+_hold_refresh = threading.Lock()
+_hold_retry = {"at": 0.0}
+
+
+def _refresh_hold() -> None:
+    if not _hold_refresh.acquire(blocking=False):
+        return
+    try:
+        if _motion() is None:
+            _hold_retry["at"] = time.time() + 15
+    finally:
+        _hold_refresh.release()
+
+
+def _hold_mode(block: bool = True) -> str:
+    """Patch head mode: 'free' (app drives), 'tucked' (semi-awake) or 'lifted'. Cached;
+    with block=False a stale cache refreshes in the background (SSH can take seconds)."""
+    if time.time() - _patch_seen["at"] > 60 or _patch_seen.get("mode") is None:
+        if block:
+            _motion()
+        elif time.time() >= _hold_retry["at"] and not _hold_refresh.locked():
+            threading.Thread(target=_refresh_hold, daemon=True).start()
+    m = _patch_seen.get("mode")
+    return m if m in ("tucked", "lifted") else "free"
+
+
+# ---------------------------------------------------------------- semi-awake
+# The conversation app stays running with the head tucked and the mic muted, so
+# waking is a mode flip (~1 s) instead of a cold start (~30 s).
+_GREETING = os.environ.get("PEACHY_GREETING", "Hi! I'm here.")
+# Body direction while dozing (world degrees, clockwise-positive; see heading.py).
+# Room watch's light thresholds come from samples taken here (.run/light_samples);
+# lights on/off differ most at −100°.
+_DOZE_DEG = max(-160.0, min(160.0, float(os.environ.get("PEACHY_DOZE_DEG", "-100"))))
+_POSE_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
+
+
+def _semi_poses() -> dict | None:
+    cal = _load_state().get("calibration") or {}
+    try:
+        s = cal["sleep"]
+        tucked = {"head": [float(s["head_pose"].get(k, 0.0)) for k in _POSE_KEYS],
+                  "antennas": [float(a) for a in s["antennas"]][:2]}
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    sys.path.insert(0, str(_SCRIPTS))
+    from head_pose import resolve_home
+
+    home = resolve_home()
+    if home:
+        hp, ant = home
+    else:
+        w = cal.get("wake") or {}
+        hp, ant = w.get("head_pose") or {}, w.get("antennas") or [0.0, 0.0]
+    lifted = {"head": [float(hp.get(k, 0.0)) for k in _POSE_KEYS],
+              "antennas": [float(a) for a in ant][:2]}
+    return {"tucked": tucked, "lifted": lifted}
+
+
+def _set_toggle_state(state: str) -> None:
+    d = _load_state()
+    d["state"] = state
+    d["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _STATE_FILE.write_text(json.dumps(d, indent=2) + "\n")
+
+
+def _enter_semi() -> tuple[bool, str]:
+    """Head tucked, mic muted, conversation app warm. Caller holds _robot_lock."""
+    poses = _semi_poses()
+    if poses is None:
+        return False, "no pose calibration — run: python scripts/ctl-toggle.py calibrate"
+    if not _patch_installed():
+        return False, "the app patch is not installed — run: scripts/app-patch.sh apply"
+    if _motion({"mode": "tucked", "body_yaw": heading.enc_rad(_DOZE_DEG), "head_pitch": 0.0, **poses}) is None:
+        return False, "robot SSH unavailable"
+    notes = [f"semi-awake — head tucked, mic off, facing {_DOZE_DEG:+.0f}°"]
+    if not _conversation_running():
+        _enable_motors()
+        c = _convo_sh("start", 60)
+        if not _conversation_running():
+            return False, ("conversation app did not start: " + (c.stdout + c.stderr).strip())[-300:]
+        try:
+            _apply_speaker_volume(_DEFAULT_VOLUME)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+            pass
+        _apply_convo_voice(_DEFAULT_CONVO_VOICE)
+        notes.append("conversation app warm")
+    _set_toggle_state("semi")
+    return True, " · ".join(notes)
+
+
+def _wake_from_semi(keep_body: bool = False) -> tuple[bool, str]:
+    """Head up, mic live, fixed greeting. Caller holds _robot_lock."""
+    upd = {"mode": "free", "head_pitch": 0.0}
+    if not keep_body:
+        upd["body_yaw"] = heading.enc_rad(0.0)
+    if _motion(upd) is None:
+        return False, "robot SSH unavailable"
+    _set_toggle_state("awake")
+
+    def greet() -> None:
+        try:
+            r = _convo_rpc("conversation.say",
+                           {"text": f'Say exactly this and nothing else: "{_GREETING}"'}, timeout=8)
+            if isinstance(r, dict) and r.get("ok") is False:
+                _logrec("converse:greet", False, str(r.get("error")))
+        except Exception as e:  # noqa: BLE001
+            _logrec("converse:greet", False, str(e)[-200:])
+
+    threading.Thread(target=greet, daemon=True).start()
+    return True, "listening — talk to Peachy"
+
+
+@app.post("/api/doze/pose")
+def doze_pose(body: dict) -> JSONResponse:
+    """Room watch looking around while Dozing: head "lifted" / "tucked" and/or the
+    body direction (yaw_deg, clockwise-positive world degrees, or encoder degrees with
+    ``"enc": true``). ``tilt_deg`` (up-positive) tilts the lifted pose; 0 restores it.
+    ``wait`` returns once the body is there."""
+    if _toggle_state() != "semi":
+        raise HTTPException(409, "not dozing")
+    if not _robot_lock.acquire(blocking=False):
+        raise HTTPException(409, "Peachy is busy — wait a sec")
+    enc = bool(body.get("enc"))
+    try:
+        upd: dict = {}
+        if body.get("head") in ("lifted", "tucked"):
+            upd["mode"] = body["head"]
+        if body.get("tilt_deg") is not None:
+            poses = _semi_poses()
+            if poses is None:
+                return JSONResponse({"ok": False, "msg": "no pose calibration"})
+            lifted = poses["lifted"]
+            head = list(lifted["head"])
+            head[4] -= math.radians(max(-_PITCH_LIM_DEG, min(_PITCH_LIM_DEG, float(body["tilt_deg"]))))
+            upd["lifted"] = {"head": head, "antennas": lifted["antennas"]}
+        yaw_rad = None
+        if body.get("yaw_deg") is not None:
+            yaw_deg = float(body["yaw_deg"])
+            yaw_deg = max(-160.0, min(160.0, yaw_deg)) if enc else heading.to_enc(yaw_deg)
+            yaw_rad = upd["body_yaw"] = -math.radians(yaw_deg)
+        if not upd:
+            return JSONResponse({"ok": False, "msg": "nothing to change"})
+        if _motion(upd) is None:
+            _logrec("doze:pose", False, "robot SSH unavailable")
+            return JSONResponse({"ok": False, "msg": "robot SSH unavailable"})
+        if "mode" in upd:
+            _logrec("doze:pose", True, "head " + upd["mode"])
+        out: dict = {"ok": True}
+        if yaw_rad is not None and body.get("wait"):
+            present = _wait_body(yaw_rad, 2.5 + abs(yaw_rad - float(
+                _daemon_json("/api/state/present_body_yaw", timeout=4))) / math.radians(90))
+            present_enc = -math.degrees(present)
+            out["present_deg"] = round(present_enc if enc else heading.to_world(present_enc), 1)
+        return JSONResponse(out)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
+        return JSONResponse({"ok": False, "msg": str(e)[-200:]})
+    finally:
+        _robot_lock.release()
 
 
 @app.get("/api/converse/idle-motion")
@@ -1853,20 +1590,26 @@ def _wait_body(target: float, limit_s: float) -> float:
 
 @app.get("/api/body")
 def body_status() -> JSONResponse:
-    """Current body yaw — commanded and measured. *_deg are clockwise-positive
-    (seen from above); *_rad are the robot's counter-clockwise-positive values."""
+    """Current body yaw — commanded and measured. *_deg are clockwise-positive world
+    degrees (seen from above, see heading.py); *_rad are the robot's
+    counter-clockwise-positive encoder values."""
     try:
-        state = _daemon_json("/api/state/full", timeout=4)
-        present = float(_daemon_json("/api/state/present_body_yaw", "GET", timeout=4))
+        state = _daemon_get("/api/state/full")
+        present = float(_daemon_get("/api/state/present_body_yaw"))
         commanded = float(state.get("body_yaw", 0.0) or 0.0)
+        lo, hi = heading.world_range()
+        pitch = float((state.get("head_pose") or {}).get("pitch", 0.0) or 0.0)
         return JSONResponse({
             "ok": True,
+            "pitch_deg": round(-math.degrees(pitch), 1),
             "yaw_rad": commanded,
-            "yaw_deg": round(-math.degrees(commanded), 1),
+            "yaw_deg": round(heading.to_world(-math.degrees(commanded)), 1),
             "present_rad": present,
-            "present_deg": round(-math.degrees(present), 1),
+            "present_deg": round(heading.to_world(-math.degrees(present)), 1),
+            "offset_deg": round(heading.offset(), 1),
+            "range_deg": [round(lo, 1), round(hi, 1)],
         })
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
         return JSONResponse({"ok": False, "msg": str(e)[-200:]})
 
 
@@ -1882,8 +1625,9 @@ def body_yaw_move(body: dict) -> JSONResponse:
     if not _robot_lock.acquire(blocking=False):
         raise HTTPException(409, "Peachy is busy — wait a sec")
     try:
-        yaw_deg = max(-160.0, min(160.0, float(body.get("yaw_deg", 0.0))))
-        yaw_rad = -math.radians(yaw_deg)
+        enc_deg = heading.to_enc(float(body.get("yaw_deg", 0.0)))
+        yaw_deg = round(heading.to_world(enc_deg), 1)
+        yaw_rad = -math.radians(enc_deg)
         dur = max(0.4, min(4.0, float(body.get("duration", 0.8))))
         t0 = time.time()
         note = ""
@@ -1891,15 +1635,15 @@ def body_yaw_move(body: dict) -> JSONResponse:
             running = _conversation_running()
             patched = _patch_installed()
             if running and patched and _motion({"body_yaw": yaw_rad}) is not None:
-                present = _wait_body(yaw_rad, 3.5 + abs(yaw_deg) / 90.0)
-                msg = f"body yaw → {yaw_deg:+.1f}° (at {-math.degrees(present):+.1f}°) · conversation kept running"
+                present = _wait_body(yaw_rad, 3.5 + abs(enc_deg) / 90.0)
+                msg = (f"body yaw → {yaw_deg:+.1f}° (at {heading.to_world(-math.degrees(present)):+.1f}°)"
+                       " · conversation kept running")
                 _logrec("body:yaw", True, f"({time.time()-t0:.1f}s) {msg}")
                 return JSONResponse({"ok": True, "msg": msg, "yaw_deg": yaw_deg})
             if patched:
                 threading.Thread(target=_motion, args=({"body_yaw": yaw_rad},), daemon=True).start()
             if running:
-                subprocess.run([str(_CONVO_SH), "stop"], cwd=_REPO, env=_script_env(),
-                               capture_output=True, text=True, timeout=25)
+                _convo_sh("stop", 25)
                 # The app's shutdown drives back to neutral over ~2 s; wait it out.
                 stopped_at = time.time()
                 last = None
@@ -1937,12 +1681,51 @@ def body_yaw_move(body: dict) -> JSONResponse:
                 present = float(_daemon_json("/api/state/present_body_yaw", timeout=4))
             if abs(yaw_rad - present) > math.radians(1.0):
                 present = goto(yaw_rad, present + rel, 0.4)
-            msg = f"body yaw → {yaw_deg:+.1f}° (at {-math.degrees(present):+.1f}°){note}"
+            msg = f"body yaw → {yaw_deg:+.1f}° (at {heading.to_world(-math.degrees(present)):+.1f}°){note}"
             _logrec("body:yaw", True, f"({time.time()-t0:.1f}s) {msg}")
             return JSONResponse({"ok": True, "msg": msg, "yaw_deg": yaw_deg})
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
             m = str(e)[-200:]
             _logrec("body:yaw", False, m)
+            return JSONResponse({"ok": False, "msg": m})
+    finally:
+        _robot_lock.release()
+
+
+_PITCH_LIM_DEG = 30.0
+
+
+@app.post("/api/head/pitch")
+def head_pitch(body: dict) -> JSONResponse:
+    """Tilt the head: pitch_deg, up-positive (the robot's pitch is down-positive).
+    With the patched conversation app running it holds the tilt in motion.json on
+    top of the app's own head motion; otherwise the head goes there directly."""
+    if _toggle_state() != "awake":
+        return JSONResponse({"ok": False, "msg": "head tilt works while Awake"})
+    if not _robot_lock.acquire(blocking=False):
+        raise HTTPException(409, "Peachy is busy — wait a sec")
+    try:
+        up = max(-_PITCH_LIM_DEG, min(_PITCH_LIM_DEG, float(body.get("pitch_deg", 0.0))))
+        pitch = -math.radians(up)
+        try:
+            if _conversation_running() and _patch_installed():
+                if _motion({"head_pitch": pitch}) is None:
+                    raise OSError("robot SSH unavailable")
+                msg = f"head tilt → {up:+.0f}° · conversation kept running"
+            else:
+                _enable_motors()
+                hp = _daemon_json("/api/state/full", timeout=4).get("head_pose") or {}
+                pose = {k: float(hp.get(k, 0.0) or 0.0) for k in _HEAD_AXES}
+                pose["pitch"] = pitch
+                dur = max(0.4, min(1.5, abs(pitch - float(hp.get("pitch", 0.0) or 0.0)) / math.radians(40)))
+                _daemon_json("/api/move/goto", "POST", {"head_pose": _clamp_head(pose), "duration": dur,
+                                                        "interpolation": "minjerk"}, timeout=12)
+                msg = f"head tilt → {up:+.0f}°"
+            _logrec("head:pitch", True, msg)
+            return JSONResponse({"ok": True, "msg": msg, "pitch_deg": up})
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError) as e:
+            m = str(e)[-200:]
+            _logrec("head:pitch", False, m)
             return JSONResponse({"ok": False, "msg": m})
     finally:
         _robot_lock.release()
@@ -2052,8 +1835,8 @@ def _http_json(url: str, timeout: float = 20.0):
 
 def _current_app() -> dict | None:
     try:
-        st = _daemon_json("/api/apps/current-app-status", timeout=4)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        st = _daemon_get("/api/apps/current-app-status")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
         return None
     if not st:
         return None
@@ -2068,12 +1851,26 @@ def _app_url(extra: dict) -> str | None:
     return u.replace("0.0.0.0", HOST).replace("127.0.0.1", HOST).replace("localhost", HOST)
 
 
+# The daemon answers list-available/installed by spawning a Python process to
+# scan entry points, which freezes its state stream for ~1 s (the conversation
+# app then drops every motion command). The list only changes on install/remove.
+_installed_cache: dict = {"at": 0.0, "raw": None}
+_INSTALLED_TTL = 3600.0
+
+
+def _installed_forget() -> None:
+    _installed_cache["raw"] = None
+
+
 @app.get("/api/apps")
 def apps_installed() -> JSONResponse:
-    try:
-        raw = _daemon_json("/api/apps/list-available/installed", timeout=20)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
-        return JSONResponse({"ok": False, "msg": str(e)[-200:], "apps": [], "current": None})
+    raw = _installed_cache["raw"]
+    if raw is None or time.time() - _installed_cache["at"] > _INSTALLED_TTL:
+        try:
+            raw = _daemon_json("/api/apps/list-available/installed", timeout=20)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+            return JSONResponse({"ok": False, "msg": str(e)[-200:], "apps": [], "current": None})
+        _installed_cache.update(at=time.time(), raw=raw)
     apps = []
     for a in raw or []:
         extra = a.get("extra") or {}
@@ -2143,6 +1940,7 @@ def apps_install(body: dict) -> JSONResponse:
         return JSONResponse({"ok": False, "msg": m})
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return JSONResponse({"ok": False, "msg": str(e)[-200:]})
+    _installed_forget()
     _logrec(f"app:install:{sid}", True, f"job {r.get('job_id')}")
     return JSONResponse({"ok": True, "job_id": r.get("job_id")})
 
@@ -2154,6 +1952,8 @@ def apps_job(job_id: str) -> JSONResponse:
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
         return JSONResponse({"ok": False, "msg": str(e)[-200:]})
     logs = j.get("logs") or []
+    if j.get("status") in ("done", "failed"):
+        _installed_forget()
     return JSONResponse({"ok": True, "status": j.get("status"),
                          "last": (logs[-1] if logs else "")[-200:]})
 
@@ -2166,6 +1966,7 @@ def apps_remove(name: str) -> JSONResponse:
         r = _daemon_json(f"/api/apps/remove/{name}", "POST", timeout=20)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
         return JSONResponse({"ok": False, "msg": str(e)[-200:]})
+    _installed_forget()
     _logrec(f"app:remove:{name}", True, f"job {r.get('job_id')}")
     return JSONResponse({"ok": True, "job_id": r.get("job_id")})
 
@@ -2180,8 +1981,6 @@ def apps_start(name: str) -> JSONResponse:
         raise HTTPException(409, "Peachy is busy with another action — wait a sec")
     try:
         _release_robot_control()
-        if _roomwatch_running():
-            _stop_roomwatch()
         wok, wmsg = _run_script([str(_SCRIPTS / "ctl-toggle.py"), "wake"], 90)
         try:
             st = _daemon_json(f"/api/apps/start-app/{name}", "POST", timeout=60)
@@ -2220,7 +2019,7 @@ _SENSE_CFG = _RUN / "sense_config.json"
 _SENSE_PID = _RUN / "sense_live.pid"
 _SENSE_LOG = _RUN / "sense_live.log"
 _SENSE_STATE = _RUN / "sense_state.json"
-_SENSE_FEATURES = ("follow", "wake")
+_SENSE_FEATURES = ("follow", "wake", "watch")
 _sense_lock = threading.Lock()
 _sense_started = {"at": 0.0}
 
@@ -2331,15 +2130,27 @@ def sense_status() -> JSONResponse:
 
 @app.get("/api/sense/gate")
 def sense_gate() -> JSONResponse:
-    owner = ""
-    if _robot_lock.locked():
-        owner = "busy"
-    cur = _current_app() if _daemon_up() else None
+    """Who owns the robot. A semi-awake conversation app (head tucked, mic muted)
+    owns nothing, so the wake word keeps listening; Follow stays off (not awake)."""
+    app_owner = ""
+    up = _daemon_up()
+    cur = _current_app() if up else None
     if cur and cur.get("state") in ("starting", "running", "stopping"):
-        owner = "conversation" if cur.get("name") == _CONVO_APP_NAME else "app"
-    elif _pid_alive(_CONVO_PID):
-        owner = "conversation"
-    return JSONResponse({"awake": _toggle_state() == "awake", "owner": owner,
+        app_owner = "conversation" if cur.get("name") == _CONVO_APP_NAME else "app"
+    semi = app_owner == "conversation" and _hold_mode(block=False) != "free"
+    if semi:
+        app_owner = ""
+    if not up:
+        app_owner = "offline"
+    elif not app_owner:
+        try:
+            if _daemon_get("/api/move/running", timeout=3):
+                app_owner = "move"
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+            pass
+    owner = "busy" if _robot_lock.locked() else app_owner
+    state = _toggle_state()
+    return JSONResponse({"awake": state == "awake", "state": state, "owner": owner, "semi": semi,
                          "speaking": time.time() < _speaker_until})
 
 
@@ -2353,6 +2164,157 @@ def sense_toggle(feature: str, onoff: str) -> JSONResponse:
     msg = f"{feature} {onoff}" if ok else "sense-live failed to start — see .run/sense_live.log"
     _logrec(f"sense:{feature}:{onoff}", ok, msg)
     return JSONResponse({"ok": ok, "msg": msg, **cfg, "running": running})
+
+
+@app.post("/api/sense/note")
+def sense_note(body: dict) -> JSONResponse:
+    """Room watch events land in the activity log."""
+    msg = str(body.get("msg") or "").strip()[:300]
+    if msg:
+        _logrec("watch", body.get("ok", True) is not False, msg)
+    return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------- heading
+# World heading: scripts/cal-heading.py matches the head camera against landmarks
+# from room scans; heading.py turns its offset into world degrees everywhere.
+# The script moves the robot through /api/doze/pose, so it runs without _robot_lock.
+_heading_lock = threading.Lock()
+_HEADING_REFS = _RUN / "heading_ref" / "refs.json"
+
+
+@app.get("/api/heading")
+def heading_status() -> JSONResponse:
+    d = heading.state()
+    try:
+        meta = json.loads(_HEADING_REFS.read_text())
+    except (OSError, ValueError):
+        meta = {}
+    scans = meta.get("passes") or ([{"refs": meta["refs"], "at": meta.get("at")}] if meta.get("refs") else [])
+    return JSONResponse({"ok": True, "offset_deg": round(heading.offset(), 1), "at": d.get("at"),
+                         "inliers": d.get("inliers"), "residual_deg": d.get("residual_deg"),
+                         "views": d.get("views"), "scans": len(scans),
+                         "refs": sum(len(s.get("refs", [])) for s in scans),
+                         "ref_at": scans[-1].get("at") if scans else None,
+                         "busy": _heading_lock.locked()})
+
+
+@app.post("/api/heading/{what}")
+def heading_run(what: str) -> JSONResponse:
+    if what not in ("capture", "anchor"):
+        raise HTTPException(404, "unknown heading action")
+    if _toggle_state() != "semi":
+        return JSONResponse({"ok": False, "msg": "heading calibration runs while Dozing"})
+    if not _heading_lock.acquire(blocking=False):
+        raise HTTPException(409, "heading calibration already running")
+    try:
+        p = subprocess.run([sys.executable, str(_SCRIPTS / "cal-heading.py"), what], cwd=_REPO,
+                           env=_script_env(), capture_output=True, text=True,
+                           timeout=300 if what == "capture" else 150)
+        ok, out = p.returncode == 0, p.stdout + "\n" + p.stderr
+    except subprocess.TimeoutExpired:
+        ok, out = False, "✗ timed out"
+    finally:
+        _heading_lock.release()
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    msg = next((ln.lstrip("✓✗ ") for ln in reversed(lines) if ln.startswith(("✓", "✗"))),
+               "failed — see scripts/cal-heading.py" if not ok else "done")
+    _logrec(f"heading:{what}", ok, msg)
+    return JSONResponse({"ok": ok, "msg": msg, "offset_deg": round(heading.offset(), 1)})
+
+
+# ---------------------------------------------------------------- mic scope
+# Its own audio-only WebRTC consumer, open only while the console is polling:
+# sense-live closes its stream during conversations, which is when the mic matters.
+_MIC_BLOCK = 320                     # 20 ms at 16 kHz
+
+
+class _MicScope:
+    IDLE_S = 10.0
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.env: deque = deque(maxlen=600)
+        self.seq = 0
+        self.want = 0.0
+        self.state = "off"
+        self.error = ""
+        self.agc: list = [None, None]
+        self.retry_at = 0.0
+        self.thread: threading.Thread | None = None
+
+    def touch(self) -> None:
+        self.want = time.time()
+        with self.lock:
+            alive = self.thread is not None and self.thread.is_alive()
+            if not alive and time.time() >= self.retry_at:
+                self.state = "connecting"
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+
+    def _agc(self) -> None:
+        for i, name in enumerate(("PP_AGCGAIN", "PP_AGCMAXGAIN")):
+            try:
+                v = _daemon_json(f"/api/audio/config/parameter/{name}", timeout=3)
+                self.agc[i] = round(float(v["values"][0]), 1)
+            except Exception:  # noqa: BLE001
+                self.agc[i] = None
+
+    def _run(self) -> None:
+        import numpy as np
+        sys.path.insert(0, str(_SCRIPTS))
+        from rtcmedia import RtcMedia
+
+        m = None
+        try:
+            m = RtcMedia(HOST, 320, 180, fps=1, video=False).start()
+            next_agc = 0.0
+            while time.time() - self.want < self.IDLE_S:
+                pcm = m.audio(_MIC_BLOCK * 5, timeout=2.0)
+                if m.error:
+                    raise RuntimeError(m.error)
+                if pcm is None:
+                    self.state = "no audio"
+                    continue
+                self.state = "on"
+                blocks = pcm[: pcm.size // _MIC_BLOCK * _MIC_BLOCK].reshape(-1, _MIC_BLOCK)
+                rms = np.sqrt(np.mean(blocks.astype(np.float32) ** 2, axis=1))
+                with self.lock:
+                    for b, r in zip(blocks, rms):
+                        self.env.append((int(b.min()), int(b.max()), int(r)))
+                        self.seq += 1
+                if time.time() >= next_agc:
+                    next_agc = time.time() + 2.0
+                    threading.Thread(target=self._agc, daemon=True).start()
+            self.state = "off"
+        except Exception as e:  # noqa: BLE001
+            self.error = str(e)[:160]
+            self.state = "error"
+            self.retry_at = time.time() + 5
+        finally:
+            if m is not None:
+                m.stop()
+
+    def since(self, seq: int) -> dict:
+        with self.lock:
+            n = min(len(self.env), max(0, self.seq - seq))
+            blocks = list(self.env)[len(self.env) - n:] if n else []
+            cur = self.seq
+        return {"state": self.state, "error": self.error if self.state == "error" else "",
+                "seq": cur, "rate": 16000 // _MIC_BLOCK,
+                "env": [v for b in blocks for v in b], "agc": self.agc[0], "agc_max": self.agc[1]}
+
+
+_mic = _MicScope()
+
+
+@app.get("/api/mic")
+def mic_scope(since: int = 0) -> JSONResponse:
+    """Mic envelope (min, max, rms per 20 ms, int16) newer than *since*. Polling keeps it open."""
+    _mic.touch()
+    d = _mic.since(since)
+    d["app_mic"] = "muted" if _patch_seen.get("mode") in ("tucked", "lifted") else "open"
+    return JSONResponse({"ok": True, **d})
 
 
 # Registered last: a single-segment {cmd} would otherwise shadow the fixed

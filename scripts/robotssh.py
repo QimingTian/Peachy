@@ -71,9 +71,13 @@ def clear_block() -> None:
 
 
 def ssh_argv(host: str | None = None) -> list[str]:
+    # One shared connection (10 min) turns each call from ~0.7 s into ~50 ms.
+    # The socket path must stay short (Unix-socket limit), hence /tmp.
     return ["ssh", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
             "-o", "KbdInteractiveAuthentication=no", "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=8", _target(host or _host())]
+            "-o", "ConnectTimeout=8", "-o", "ControlMaster=auto",
+            "-o", "ControlPath=/tmp/peachy-ssh-%C", "-o", "ControlPersist=600",
+            _target(host or _host())]
 
 
 def _target(host: str) -> str:

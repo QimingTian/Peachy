@@ -74,12 +74,12 @@ a_head_jog() {
   python scripts/cal-head.py --from-saved
 }
 
-a_watch_dry() { run "Room watch — DRY RUN (sensors only, no movement)" python scripts/watch-room.py --dry-run; }
+a_watch_dry() { run "Room watch — DRY RUN (sensors only, no movement)" python scripts/sense-live.py --watch --dry-run; }
 a_watch_live(){
-  warn "Live room watch: robot will actually move on state transitions."
-  warn "Ctrl+C to stop. Needs calibration done (see option 7)."
+  warn "Live room watch: dozes by day, looks around when the lights come on."
+  warn "Needs the dashboard running (option 13); its Room watch switch does the same."
   confirm "Start live room watch?" || { warn "skipped"; return; }
-  python scripts/watch-room.py
+  python scripts/sense-live.py --watch
 }
 
 a_convo_start() { run "Wake + start conversation app" scripts/app-conversation.sh start; }
@@ -105,7 +105,7 @@ menu() {
   printf '   5) Expression…\n'
   printf '  %sBEHAVIOR%s\n' "$B" "$N"
   printf '   6) Room watch — dry-run (safe, no movement)\n'
-  printf '   7) Room watch — LIVE  (the dream)\n'
+  printf '   7) Room watch — LIVE\n'
   printf '  %sCAMERA / TUNING%s\n' "$B" "$N"
   printf '   8) Take a photo\n'
   printf '   9) Calibrate sleep/wake poses  (moves robot)\n'

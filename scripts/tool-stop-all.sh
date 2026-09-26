@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stop Peachy automation — one command when too many things are running.
 #
-#   ./scripts/tool-stop-all.sh           # halt moves, conversation, room watch, senses
+#   ./scripts/tool-stop-all.sh           # halt moves, conversation, senses (incl. room watch)
 #   ./scripts/tool-stop-all.sh --sleep   # same + gentle sleep
 #
 # Does not stop the dashboard or the robot daemon.
@@ -27,23 +27,12 @@ curl -sf -m4 -X POST "http://${HOST}:${PORT}/api/move/stop" \
   -H "Content-Type: application/json" -d '{}' >/dev/null 2>&1 \
   && msgs+=("move halted") || msgs+=("move halt skipped")
 
-if [ -f "${RUN}/dashboard_roomwatch.pid" ]; then
-  pid="$(cat "${RUN}/dashboard_roomwatch.pid" 2>/dev/null || true)"
-  if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-    kill "${pid}" 2>/dev/null || true
-    sleep 0.3
-    kill -9 "${pid}" 2>/dev/null || true
-    msgs+=("room watch stopped")
-  fi
-  rm -f "${RUN}/dashboard_roomwatch.pid"
-fi
-
 if [ -f "${RUN}/sense_config.json" ]; then
   python3 - "${RUN}/sense_config.json" <<'EOF' 2>/dev/null || true
 import json, sys
 p = sys.argv[1]
 cfg = json.load(open(p))
-cfg.update(follow=False, wake=False)
+cfg.update(follow=False, wake=False, watch=False)
 json.dump(cfg, open(p, "w"))
 EOF
 fi

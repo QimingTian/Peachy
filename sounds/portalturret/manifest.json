@@ -20,12 +20,6 @@
     "deploying",
     "your_business_is_appreciated"
   ],
-  "warmup_bridge": {
-    "opening": "whos_there",
-    "waiting": "searching",
-    "countdown": "deploying",
-    "ready": "activated"
-  },
   "sounds": {
     "activated": { "file": "activated.wav", "label": "Activated" },
     "are_you_still_there": { "file": "are_you_still_there.wav", "label": "Still there?" },

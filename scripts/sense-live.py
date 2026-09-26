@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Peachy's senses, run on this Mac: follow faces / voices, and "Hey Reachy".
+"""Peachy's senses, run on this Mac: follow faces / voices, "Hi Peachy", room watch.
 
 Face tracking runs in the daemon when it supports it (1.11+), otherwise here
 on the WebRTC video (rtcmedia.py); the mic stream feeds the wake word. Body
@@ -12,7 +12,12 @@ dashboard action) and resumes after.
 
 --follow  track the nearest face; prefer whoever is talking (mic direction);
           turn the body toward a voice when nobody is in view
---wake    "Hey Reachy" / "Hey Peachy" starts the conversation app
+--wake    "Hi Peachy" starts the conversation app
+--watch   day (PEACHY_DAY, 07:00-23:00): Dozing, body at PEACHY_DOZE_DEG. When the
+          lights come on, lift the head and sweep the body; a face wakes Peachy,
+          nobody means back to Dozing. A conversation nobody has spoken to for
+          PEACHY_DOZE_AFTER_S goes back to Dozing. Night: asleep.
+          Needs the console (it owns every robot action).
 
 Status is written to .run/sense_state.json for the dashboard.
 """
@@ -32,6 +37,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +47,6 @@ _REPO = Path(__file__).resolve().parent.parent
 _RUN = _REPO / ".run"
 _MODELS = _RUN / "models"
 _STATE_FILE = _RUN / "reachy_toggle_state.json"
-_CONVO_PID = _RUN / "conversation_app.pid"
 _OUT = _RUN / "sense_state.json"
 _YUNET = _MODELS / "face_detection_yunet_2023mar.onnx"
 _YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/"
@@ -48,6 +54,7 @@ _YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hostfind import resolve_host  # noqa: E402
+import heading  # noqa: E402
 
 HOST = resolve_host()
 PORT = int(os.environ.get("REACHY_PORT", "8000"))
@@ -60,6 +67,11 @@ HEAD_YAW_MAX = math.radians(30)
 PITCH_MIN, PITCH_MAX = math.radians(-22), math.radians(25)
 BODY_MAX = math.radians(160)
 BODY_STEP = math.radians(5)
+
+DOZE_DEG = float(os.environ.get("PEACHY_DOZE_DEG", "-100"))
+DAY = os.environ.get("PEACHY_DAY", "07:00-23:00")
+DOZE_AFTER_S = float(os.environ.get("PEACHY_DOZE_AFTER_S", "180"))
+_SAMPLES = _RUN / "light_samples"
 
 
 def log(msg: str) -> None:
@@ -107,14 +119,6 @@ def dash(path: str, method: str = "GET", body: dict | None = None, timeout: floa
     return _http(_dash_url() + path, method, body, timeout, {"X-Peachy-Token": _dash_token()})
 
 
-def _pid_alive(p: Path) -> bool:
-    try:
-        os.kill(int(p.read_text().strip()), 0)
-        return True
-    except (OSError, ValueError):
-        return False
-
-
 class Robot:
     """Latest daemon state (websocket) plus who-owns-the-robot gate."""
 
@@ -146,29 +150,44 @@ class Robot:
         except (OSError, json.JSONDecodeError):
             awake = False
         owner = ""
-        if _pid_alive(_CONVO_PID):
-            owner = "conversation"
         try:
             st = daemon("/api/apps/current-app-status", timeout=3) or {}
             if st and st.get("state") in ("starting", "running", "stopping"):
                 name = (st.get("info") or {}).get("name", "")
                 owner = "conversation" if name == CONVO_APP else "app"
+            elif daemon("/api/move/running", timeout=3):
+                owner = "move"
         except (urllib.error.URLError, OSError, ValueError):
-            owner = owner or "offline"
+            owner = "offline"
         return {"awake": awake, "owner": owner}
 
     def _gate_loop(self) -> None:
+        """The console's gate already covers apps, moves and offline; ask the
+        daemon directly only when the console has failed for a while. Never
+        exits: a dead gate thread would freeze wake word and room watch."""
+        good = 0.0
+        err = ""
         while not self._stop.is_set():
             try:
-                g = dash("/api/sense/gate", timeout=3)
-            except (urllib.error.URLError, OSError, ValueError):
-                g = self._local_gate()
-            try:
-                running = daemon("/api/move/running", timeout=3)
-                if running and not g.get("owner"):
-                    g["owner"] = "move"
-            except (urllib.error.URLError, OSError, ValueError):
-                g["owner"] = g.get("owner") or "offline"
+                g = dash("/api/sense/gate", timeout=4)
+                good = time.time()
+                if err:
+                    log(f"console gate back (was: {err})")
+                    err = ""
+            except Exception as e:  # noqa: BLE001
+                why = f"{type(e).__name__}: {e}"[:120]
+                if not err:
+                    log(f"console gate failed — {why}")
+                err = why
+                if time.time() - good < 10:
+                    self.gate_ts = time.time()
+                    time.sleep(1.0)
+                    continue
+                try:
+                    g = self._local_gate()
+                except Exception as e2:  # noqa: BLE001
+                    g = {"awake": False, "owner": "offline"}
+                    log(f"local gate failed — {type(e2).__name__}: {e2}"[:160])
             self.gate = g
             self.gate_ts = time.time()
             time.sleep(1.0)
@@ -234,6 +253,14 @@ class Media:
         self.state = "off"
 
 
+def _face_detector():
+    import cv2
+    if not _YUNET.is_file():
+        _MODELS.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(_YUNET_URL, _YUNET)
+    return cv2.FaceDetectorYN.create(str(_YUNET), "", (FRAME_W, FRAME_H), 0.7, 0.3, 20)
+
+
 class Follower:
     needs_media = True
 
@@ -241,12 +268,7 @@ class Follower:
         pass
 
     def __init__(self, robot: Robot, dry: bool) -> None:
-        import cv2
-        if not _YUNET.is_file():
-            _MODELS.mkdir(parents=True, exist_ok=True)
-            urllib.request.urlretrieve(_YUNET_URL, _YUNET)
-        self.cv2 = cv2
-        self.det = cv2.FaceDetectorYN.create(str(_YUNET), "", (FRAME_W, FRAME_H), 0.7, 0.3, 20)
+        self.det = _face_detector()
         self.robot = robot
         self.dry = dry
         self.status = "off"
@@ -520,23 +542,390 @@ def daemon_tracking_available() -> bool:
         return False
 
 
+def is_day(now: datetime | None = None) -> bool:
+    try:
+        a, b = ((int(h) * 60 + int(m)) for h, m in (x.strip().split(":") for x in DAY.split("-")))
+    except ValueError:
+        a, b = 7 * 60, 23 * 60
+    now = now or datetime.now()
+    t = now.hour * 60 + now.minute
+    return a <= t < b if a <= b else (t >= a or t < b)
+
+
+def light_thresholds(deg: float) -> dict:
+    """Cut-offs at this body direction from the cal-light.py samples. At or below
+    dark_max is dark, at or above lit_min is lit, in between keeps the last call.
+    A dark→lit change counts as a lamp only if it rose by `jump` within
+    RoomWatch.WINDOW_S; daylight through the window is far slower."""
+    ref = {}
+    for label in ("dark", "lit"):
+        try:
+            rows = [json.loads(ln) for ln in (_SAMPLES / label / "samples.jsonl").read_text().splitlines()
+                    if ln.strip()]
+        except (OSError, ValueError):
+            rows = []
+        if not rows:
+            continue
+        gap = min(abs(float(r["body_deg"]) - deg) for r in rows)
+        if gap > 15:
+            continue
+        vals = sorted(float(r["mean"]) for r in rows if abs(float(r["body_deg"]) - deg) <= gap + 3)
+        ref[label] = vals[len(vals) // 2]
+    dark, lit = ref.get("dark"), ref.get("lit")
+    if dark is None or lit is None or lit - dark < 15:
+        return {"dark_max": 30.0, "lit_min": 70.0, "jump": 35.0, "dark": dark, "lit": lit}
+    span = lit - dark
+    return {"dark_max": round(dark + 0.25 * span, 1), "lit_min": round(dark + 0.7 * span, 1),
+            "jump": round(0.5 * span, 1), "dark": round(dark, 1), "lit": round(lit, 1)}
+
+
+def scan_path(start: float, step: float = 55.0) -> list[float]:
+    """Body stops for one look-around from `start` (world degrees): out to the far
+    end of the body's ±160° encoder range, then the near end unless the ~90° camera
+    saw it."""
+    def leg(a: float, b: float) -> list[float]:
+        n = max(1, math.ceil(abs(b - a) / step))
+        return [a + (b - a) * i / n for i in range(1, n + 1)]
+    s = heading.to_enc(start)
+    far = heading.ENC_LIMIT if s <= 0 else -heading.ENC_LIMIT
+    path = leg(s, far)
+    if abs(-far - s) > 60:
+        path += leg(s, -far)
+    return [round(heading.to_world(a)) for a in path]
+
+
+class ConvoActivity:
+    """When someone last spoke to the conversation app, from its /rpc notifications."""
+
+    USER = {"user_speech_started", "user_transcription_completed"}
+
+    def __init__(self, robot: Robot) -> None:
+        self.robot = robot
+        self.last = 0.0
+        self.connected = False
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _wanted(self) -> bool:
+        g = self.robot.gate
+        return g.get("owner") == "conversation" or bool(g.get("semi"))
+
+    def _loop(self) -> None:
+        from websockets.sync.client import connect
+        while True:
+            if not self._wanted():
+                time.sleep(2)
+                continue
+            try:
+                with connect(f"ws://{HOST}:7860/rpc", open_timeout=5) as ws:
+                    self.connected = True
+                    while self._wanted():
+                        try:
+                            msg = json.loads(ws.recv(timeout=5))
+                        except TimeoutError:
+                            continue
+                        p = msg.get("params") or {}
+                        if ((msg.get("method") == "conversation.activity" and p.get("reason") in self.USER)
+                                or (msg.get("method") == "conversation.transcript" and p.get("role") == "user")):
+                            self.last = time.time()
+            except Exception:  # noqa: BLE001
+                pass
+            self.connected = False
+            time.sleep(3)
+
+
+class RoomWatch:
+    """Day: Dozing facing DOZE_DEG; lights on → lift the head and sweep for a face.
+    Every robot action goes through the console, which owns the robot lock."""
+
+    SETTLE_S = 3.0
+    WINDOW_S = 8.0
+
+    def __init__(self, robot: Robot, dry: bool) -> None:
+        self.robot = robot
+        self.dry = dry
+        self.det = _face_detector()
+        self.convo = ConvoActivity(robot)
+        self.th = light_thresholds(DOZE_DEG)
+        self.status = "starting"
+        self.period: str | None = None
+        self.state: str | None = None
+        self.awake_since = 0.0
+        self.doze_in: float | None = None
+        self.luma: float | None = None
+        self.level: str | None = None
+        self.last_level: str | None = None
+        self.raw: deque = deque()
+        self.smooth: deque = deque()
+        self.settled_since = 0.0
+        self.away_since = 0.0
+        self.history: deque = deque(maxlen=120)
+        self.history_at = 0.0
+        self.event = ""
+        self.event_at = 0.0
+        self.faces = 0
+        self.face_hits: deque = deque(maxlen=30)
+        self.scanning = False
+        self.worker: threading.Thread | None = None
+        src = "samples" if self.th["dark"] is not None else "defaults"
+        log(f"watch: day {DAY}, doze at {DOZE_DEG:+.0f}°, dark ≤ {self.th['dark_max']}, "
+            f"lit ≥ {self.th['lit_min']}, lamp jump ≥ {self.th['jump']} ({src})")
+
+    def note(self, msg: str, ok: bool = True) -> None:
+        self.event, self.event_at = msg, time.time()
+        log(f"watch: {msg}")
+        text = f"{msg} (dry run)" if self.dry else msg
+
+        def post() -> None:
+            try:
+                dash("/api/sense/note", "POST", {"msg": text, "ok": ok}, timeout=4)
+            except Exception:  # noqa: BLE001
+                pass
+        threading.Thread(target=post, daemon=True).start()
+
+    def busy(self) -> bool:
+        return self.worker is not None and self.worker.is_alive()
+
+    def act(self, what: str, fn) -> None:
+        if self.busy():
+            return
+
+        def run() -> None:
+            try:
+                fn()
+            except urllib.error.HTTPError as e:
+                self.note(f"{what}: console declined ({e.code})", ok=False)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                self.note(f"{what} failed: {e}", ok=False)
+
+        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker.start()
+
+    def call(self, path: str, body: dict | None = None, timeout: float = 150.0) -> dict:
+        if self.dry:
+            log(f"(dry run — would POST {path} {json.dumps(body) if body else ''})")
+            return {"ok": True}
+        r = dash(path, "POST", body, timeout=timeout)
+        if isinstance(r, dict) and r.get("ok") is False:
+            raise OSError(r.get("msg") or f"{path} failed")
+        return r
+
+    def wants_media(self) -> bool:
+        return self.scanning or (self.period == "day" and self.state == "semi")
+
+    def body_deg(self) -> float | None:
+        if not self.robot.fresh():
+            return None
+        return heading.to_world(-math.degrees(float(self.robot.state.get("body_yaw") or 0.0)))
+
+    def step(self, frame) -> None:
+        now = time.time()
+        g = self.robot.gate
+        if now - self.robot.gate_ts > 5 or "state" not in g:
+            self.status = "no console"
+            return
+        state, owner = g.get("state"), g.get("owner", "")
+        if state != self.state:
+            if state == "awake":
+                self.awake_since = now
+            self.state = state
+        period = "day" if is_day() else "night"
+        if period != self.period:
+            first = self.period is None
+            self.period = period
+            self._schedule(period, state, owner, first)
+        self.doze_in = None
+
+        if self.scanning:
+            self.status = "looking"
+            self._look(frame, now)
+            return
+        if state == "awake" and owner == "conversation":
+            self.status = "awake"
+            self._reset_light()
+            idle = now - max(self.convo.last, self.awake_since)
+            self.doze_in = max(0.0, DOZE_AFTER_S - idle)
+            if idle >= DOZE_AFTER_S and not self.busy():
+                self.awake_since = now - DOZE_AFTER_S + 30
+                if period == "day":
+                    self.note(f"nobody has spoken for {idle / 60:.0f} min — dozing")
+                    self.act("doze", lambda: self.call("/api/do/semi"))
+                else:
+                    self.note(f"nobody has spoken for {idle / 60:.0f} min — going to sleep")
+                    self.act("sleep", lambda: self.call("/api/do/sleep"))
+            return
+        if period == "day" and state == "semi" and g.get("semi") and not owner and not self.busy():
+            self._light(frame, now)
+            return
+        self._reset_light()
+        if owner and owner != "conversation":
+            self.status = f"paused:{owner}"
+        else:
+            self.status = {"asleep": "night" if period == "night" else "asleep",
+                           "semi": "dozing", "awake": "awake"}.get(state or "", "waiting")
+
+    def _schedule(self, period: str, state: str | None, owner: str, first: bool) -> None:
+        if period == "day":
+            if state == "asleep":
+                self.note("day — dozing" if first else "morning — dozing")
+                self.act("doze", lambda: self.call("/api/do/semi"))
+        elif state == "semi" or (state == "awake" and not owner):
+            self.note("night — going to sleep")
+            self.act("sleep", lambda: self.call("/api/do/sleep"))
+
+    def _reset_light(self) -> None:
+        self.level = None
+        self.raw.clear()
+        self.smooth.clear()
+        self.settled_since = 0.0
+
+    def _light(self, frame, now: float) -> None:
+        deg = self.body_deg()
+        target = heading.to_world(heading.to_enc(DOZE_DEG))
+        if deg is None or abs(heading.wrap(deg - target)) > 4:
+            self._reset_light()
+            self.status = "settling"
+            self.away_since = self.away_since or now
+            if deg is not None and now - self.away_since > 6:
+                self.away_since = now
+                self.note(f"body at {deg:+.0f}°, turning back to {target:+.0f}°")
+                self.act("face the doze direction", lambda: self.call(
+                    "/api/doze/pose", {"head": "tucked", "yaw_deg": DOZE_DEG, "wait": True}, 30))
+            return
+        self.away_since = 0.0
+        if frame is None:
+            self.status = "waiting for camera"
+            return
+        self.settled_since = self.settled_since or now
+        y = float((frame[::4, ::4].astype(np.float32) @ np.array([0.114, 0.587, 0.299], np.float32)).mean())
+        self.luma = y
+        if now - self.settled_since < self.SETTLE_S:
+            self.status = "settling"
+            return
+        self.status = "dozing"
+        self.raw.append((now, y))
+        while self.raw and now - self.raw[0][0] > 0.6:
+            self.raw.popleft()
+        vals = sorted(v for _, v in self.raw)
+        cur = vals[len(vals) // 2]
+        self.smooth.append((now, cur))
+        while self.smooth and now - self.smooth[0][0] > self.WINDOW_S:
+            self.smooth.popleft()
+        if now - self.history_at >= 1.0:
+            self.history_at = now
+            self.history.append(round(cur, 1))
+        th = self.th
+        if self.level is None:
+            if len(self.smooth) >= 5:
+                self.level = "lit" if cur >= th["lit_min"] else "dark"
+                log(f"watch: room is {self.level} ({cur:.0f})")
+            return
+        if self.level == "dark" and cur >= th["lit_min"]:
+            self.level = "lit"
+            base = min(v for _, v in self.smooth)
+            if cur - base >= th["jump"]:
+                self.note(f"lights on ({base:.0f} → {cur:.0f}) — looking around")
+                self.start_scan()
+            else:
+                self.note(f"brightened slowly ({base:.0f} → {cur:.0f}) — daylight, staying put")
+        elif self.level == "lit" and cur <= th["dark_max"]:
+            self.level = "dark"
+            self.note(f"lights off ({cur:.0f})")
+
+    def start_scan(self) -> None:
+        if self.busy():
+            return
+        self.face_hits.clear()
+        self.scanning = True
+        self.act("look around", self._scan)
+
+    def _look(self, frame, now: float) -> None:
+        if frame is None:
+            return
+        _, res = self.det.detect(frame)
+        self.faces = 0 if res is None else len(res)
+        if self.faces:
+            self.face_hits.append(now)
+
+    def _face_seen(self) -> bool:
+        now = time.time()
+        return sum(1 for t in self.face_hits if now - t < 1.0) >= 2
+
+    def _dwell(self, seconds: float) -> bool:
+        end = time.time() + seconds
+        while time.time() < end:
+            if self._face_seen():
+                return True
+            time.sleep(0.1)
+        return self._face_seen()
+
+    def _scan(self) -> None:
+        found = done = False
+        try:
+            self.call("/api/doze/pose", {"head": "lifted"}, 20)
+            found = self._dwell(1.8)
+            if not found:
+                for deg in scan_path(DOZE_DEG):
+                    if self.robot.gate.get("state") != "semi":
+                        self.note("look-around interrupted")
+                        done = True
+                        return
+                    self.call("/api/doze/pose", {"yaw_deg": deg, "wait": True}, 30)
+                    if self._dwell(0.9):
+                        found = True
+                        break
+            if found:
+                at = self.body_deg()
+                self.note("someone's here" + (f" at {at:+.0f}°" if at is not None else "") + " — waking up")
+                self.call("/api/converse/start?keep_body=1", timeout=60)
+            else:
+                self.note("nobody around — back to dozing")
+                self.call("/api/doze/pose", {"head": "tucked", "yaw_deg": DOZE_DEG, "wait": True}, 30)
+            done = True
+        finally:
+            self.scanning = False
+            if not done and not found and self.robot.gate.get("state") == "semi":
+                try:
+                    self.call("/api/doze/pose", {"head": "tucked", "yaw_deg": DOZE_DEG, "wait": True}, 30)
+                except (urllib.error.URLError, OSError, ValueError):
+                    pass
+
+    def snapshot(self) -> dict:
+        self.last_level = self.level or self.last_level
+        return {
+            "status": self.status, "period": self.period, "level": self.level,
+            "last_level": self.last_level,
+            "luma": None if self.luma is None else round(self.luma, 1),
+            "dark_max": self.th["dark_max"], "lit_min": self.th["lit_min"],
+            "doze_deg": DOZE_DEG, "day": DAY, "doze_in": self.doze_in,
+            "event": self.event, "event_at": self.event_at or None,
+            "faces": self.faces, "history": list(self.history),
+        }
+
+
 _GREET = {"hey", "hi", "hello", "ok", "okay", "yo"}
-_NAMES = ["reachy", "peachy", "reachie", "richie", "ritchie", "peachie", "reechy"]
+_NAMES = ["peachy", "peachie", "peachey", "peachi"]
+_NOT_NAMES = ["reachy", "reachie", "reechy", "richie", "ritchie"]
 
 
 def _words(text: str) -> list[str]:
     return re.findall(r"[a-z']+", text.lower())
 
 
+def _closest(word: str, names: list[str]) -> float:
+    return max(difflib.SequenceMatcher(None, word, n).ratio() for n in names)
+
+
+def is_name(word: str) -> bool:
+    """Close to "Peachy" and at least as close to it as to "Reachy" — the two
+    are 0.83 alike, so a plain threshold would still wake on "Reachy"."""
+    near = _closest(word, _NAMES)
+    return near >= 0.72 and near >= _closest(word, _NOT_NAMES)
+
+
 def heard_wake(text: str) -> bool:
     """A greeting followed by Peachy's name, at the start of the utterance."""
     words = _words(text)[:4]
-    for i, w in enumerate(words[:-1]):
-        if w in _GREET:
-            nxt = words[i + 1]
-            if any(difflib.SequenceMatcher(None, nxt, n).ratio() >= 0.72 for n in _NAMES):
-                return True
-    return False
+    return any(w in _GREET and is_name(words[i + 1]) for i, w in enumerate(words[:-1]))
 
 
 def starts_with_greeting(text: str) -> bool:
@@ -544,7 +933,7 @@ def starts_with_greeting(text: str) -> bool:
 
 
 class WakeWord:
-    """ "Hey Peachy" → start a conversation.
+    """ "Hi Peachy" → start a conversation.
 
     Listens only while the robot is idle and has been quiet for SETTLE_S: any
     gate owner (dashboard action, motion, robot speaker, conversation, app)
@@ -555,7 +944,7 @@ class WakeWord:
 
     RATE = 16000
     SETTLE_S = 4.0
-    PROMPT = "Hey Reachy. Hey Peachy."
+    PROMPT = "Hi Peachy."
 
     def __init__(self, robot: Robot, dry: bool) -> None:
         os.environ.setdefault("HF_HUB_CACHE", str(_MODELS / "hf"))
@@ -566,7 +955,7 @@ class WakeWord:
         self.dry = dry
         self.status = "off"
         self.ring = np.zeros(int(self.RATE * 2.6), dtype=np.int16)
-        self.floor = 300.0
+        self.floor = 100.0
         self.voice_until = 0.0
         self.next_asr = 0.0
         self.last_text = ""
@@ -596,16 +985,27 @@ class WakeWord:
             return "settling"
         return ""
 
+    @staticmethod
+    def voice_rms(pcm: np.ndarray) -> float:
+        """RMS in 300–3400 Hz: the room's air conditioning hums at 117/180 Hz and
+        full-band, speech from 4 m was under 3× the floor; in-band it is ~10×."""
+        if not pcm.size:
+            return 0.0
+        spec = np.fft.rfft(pcm.astype(np.float32))
+        f = np.fft.rfftfreq(pcm.size, 1 / WakeWord.RATE)
+        spec[(f < 300) | (f > 3400)] = 0
+        return float(np.sqrt(np.mean(np.fft.irfft(spec, pcm.size) ** 2)))
+
     def feed(self, pcm: np.ndarray) -> None:
         n = pcm.size
         self.ring = np.concatenate([self.ring[n:], pcm])
-        rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2))) if n else 0.0
+        rms = self.voice_rms(pcm)
         self.level = rms
         now = time.time()
-        if rms > max(3.0 * self.floor, 250.0):
+        if rms > max(3.0 * self.floor, 150.0):
             self.voice_until = now + 0.9
         else:
-            self.floor = 0.97 * self.floor + 0.03 * max(rms, 50.0)
+            self.floor = 0.97 * self.floor + 0.03 * max(rms, 30.0)
         why = self.allowed()
         if why:
             self.status = f"paused:{why}"
@@ -661,14 +1061,15 @@ class WakeWord:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Peachy senses: follow faces/voices, wake word")
     ap.add_argument("--follow", action="store_true", help="track faces and turn to voices")
-    ap.add_argument("--wake", action="store_true", help='"Hey Reachy" starts a conversation')
+    ap.add_argument("--wake", action="store_true", help='"Hi Peachy" starts a conversation')
+    ap.add_argument("--watch", action="store_true", help="day Dozing, look around when the lights come on")
     ap.add_argument("--dry-run", action="store_true", help="detect only; no motion, no conversation")
     ap.add_argument("--rate", type=float, default=10.0, help="follow control rate (Hz)")
     ap.add_argument("--engine", choices=("auto", "daemon", "laptop"), default="auto",
                     help="face tracking on the robot (daemon 1.11+) or here from the video")
     args = ap.parse_args()
-    if not (args.follow or args.wake):
-        ap.error("pick --follow and/or --wake")
+    if not (args.follow or args.wake or args.watch):
+        ap.error("pick --follow, --wake and/or --watch")
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -684,7 +1085,8 @@ def main() -> int:
             engine = "daemon" if daemon_tracking_available() else "laptop"
         follower = (DaemonFollower if engine == "daemon" else Follower)(robot, args.dry_run)
     wake = WakeWord(robot, args.dry_run) if args.wake else None
-    log(f"sense-live on {HOST} — follow={engine or 'off'} wake={bool(wake)}"
+    watch = RoomWatch(robot, args.dry_run) if args.watch else None
+    log(f"sense-live on {HOST} — follow={engine or 'off'} wake={bool(wake)} watch={bool(watch)}"
         f"{' (dry run)' if args.dry_run else ''}")
 
     if wake is not None:
@@ -709,7 +1111,14 @@ def main() -> int:
         t0 = time.time()
         need_follow = follower is not None and follower.allowed() in ("", "yielding")
         need_wake = wake is not None and wake.allowed() in ("", "cooldown")
-        m = media.get((need_follow and follower.needs_media) or need_wake)
+        need_watch = watch is not None and watch.wants_media()
+        m = media.get((need_follow and follower.needs_media) or need_wake or need_watch)
+        if watch is not None:
+            try:
+                watch.step(m.frame() if (m is not None and need_watch) else None)
+            except Exception as e:  # noqa: BLE001
+                watch.status = "error"
+                log(f"watch error: {e}")
         if follower is not None:
             try:
                 follower.step(m.frame() if (m is not None and need_follow) else None)
@@ -733,7 +1142,9 @@ def main() -> int:
                     "target": follower.target, "size": [FRAME_W, FRAME_H]},
                 "wake": None if wake is None else {
                     "status": wake.status, "heard_at": wake.heard_at or None,
-                    "last_text": wake.last_text[-120:], "level": round(wake.level)},
+                    "last_text": wake.last_text[-120:], "level": round(wake.level),
+                    "floor": round(wake.floor)},
+                "watch": None if watch is None else watch.snapshot(),
             }
             try:
                 tmp = _OUT.with_suffix(".tmp")

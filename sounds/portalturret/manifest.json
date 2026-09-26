@@ -1,0 +1,48 @@
+{
+  "pack": "portalturret",
+  "cues": {
+    "wake": "activated",
+    "sleep": "goodnight",
+    "snap": "searching"
+  },
+  "sleep_farewells": [
+    "goodnight",
+    "shutting_down",
+    "hibernating",
+    "nap_time",
+    "goodbye",
+    "sleep_mode_activated"
+  ],
+  "wake_greetings": [
+    "hello",
+    "activated",
+    "whos_there",
+    "deploying",
+    "your_business_is_appreciated"
+  ],
+  "warmup_bridge": {
+    "opening": "whos_there",
+    "waiting": "searching",
+    "countdown": "deploying",
+    "ready": "activated"
+  },
+  "sounds": {
+    "activated": { "file": "activated.wav", "label": "Activated" },
+    "are_you_still_there": { "file": "are_you_still_there.wav", "label": "Still there?" },
+    "deploying": { "file": "deploying.wav", "label": "Deploying" },
+    "goodbye": { "file": "goodbye.wav", "label": "Goodbye" },
+    "goodnight": { "file": "goodnight.wav", "label": "Goodnight" },
+    "hello": { "file": "hello.wav", "label": "Hello" },
+    "hibernating": { "file": "hibernating.wav", "label": "Hibernating" },
+    "nap_time": { "file": "nap_time.wav", "label": "Nap time" },
+    "resting": { "file": "resting.wav", "label": "Resting" },
+    "searching": { "file": "searching.wav", "label": "Searching" },
+    "shutting_down": { "file": "shutting_down.wav", "label": "Shutting down" },
+    "sleep_mode_activated": { "file": "sleep_mode_activated.wav", "label": "Sleep mode" },
+    "whos_there": { "file": "whos_there.wav", "label": "Who's there?" },
+    "your_business_is_appreciated": {
+      "file": "your_business_is_appreciated.wav",
+      "label": "Business appreciated"
+    }
+  }
+}

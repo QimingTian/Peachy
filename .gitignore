@@ -1,0 +1,17 @@
+# Runtime state and secrets (token, host cache, calibration, logs, models, pids)
+.run/
+# Last camera frame (classroom photo)
+dashboard/static/snap.jpg
+# Personal / machine-local
+reachSSH-ifconfig.txt
+agents.local.md
+.claude/
+
+# Environment and build artifacts
+reachy_mini_env/
+*.pyc
+__pycache__/
+*.egg-info/
+build/
+dist/
+.DS_Store

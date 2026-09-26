@@ -1,0 +1,10 @@
+# Peachy — pip install -r requirements.txt inside the venv
+reachy-mini
+opencv-python-headless
+numpy
+fastapi
+uvicorn
+qrcode
+Pillow
+websockets
+faster-whisper

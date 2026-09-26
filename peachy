@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Peachy control deck — interactive entry point.
+# Auto-sources the venv and wraps the most-used scripts with verbose feedback.
+# The desktop console (./run.sh) is the main surface; this is the terminal fallback.
+set -u
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+# venv autoload (no-op if already active)
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -f reachy_mini_env/bin/activate ]; then
+  # shellcheck source=/dev/null
+  source reachy_mini_env/bin/activate
+fi
+
+# colors (best-effort, no-op if tput missing)
+if command -v tput >/dev/null 2>&1; then
+  B="$(tput bold)"; D="$(tput dim)"; G="$(tput setaf 2)"; Y="$(tput setaf 3)"
+  R="$(tput setaf 1)"; C="$(tput setaf 6)"; M="$(tput setaf 5)"; N="$(tput sgr0)"
+else B=""; D=""; G=""; Y=""; R=""; C=""; M=""; N=""; fi
+
+bar() { printf '%s──────────────────────────────────────────────%s\n' "$D" "$N"; }
+say() { printf '%s%s%s\n' "$C" "$*" "$N"; }
+warn() { printf '%s%s%s\n' "$Y" "$*" "$N"; }
+ok()   { printf '%s✓ %s%s\n' "$G" "$*" "$N"; }
+err()  { printf '%s✗ %s%s\n' "$R" "$*" "$N"; }
+hdr()  { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+pause(){ printf '\n%spress Enter to return to menu…%s ' "$D" "$N"; read -r _; }
+
+run() {  # run "<label>" cmd args...
+  local label="$1"; shift
+  bar; say "→ $label"; say "$D$ $*$N"; bar
+  if "$@"; then bar; ok "$label — done"; else bar; err "$label — failed (exit $?)"; fi
+}
+
+confirm() { printf '%s%s [y/N]:%s ' "$Y" "$*" "$N"; read -r a; [[ "$a" =~ ^[Yy]$ ]]; }
+
+# ─── action wrappers ──────────────────────────────────────────────────────
+
+a_status() {
+  run "Find Peachy on the network" ./scripts/net-connect.sh
+  run "Read robot status (pose, state, control_mode)" python scripts/ctl-toggle.py status
+}
+
+a_wake()    { run "Wake Peachy (head up)" python scripts/ctl-toggle.py wake; }
+a_sleep()   { run "Sleep Peachy (head down)" python scripts/ctl-toggle.py sleep; }
+a_toggle()  { run "Toggle sleep ↔ wake (state-aware)" python scripts/ctl-toggle.py toggle; }
+
+a_express() {
+  local opts=(yes no curious lookaround excited shy stretch)
+  hdr "Expression"
+  local i=1; for e in "${opts[@]}"; do printf "  %2d) %s\n" "$i" "$e"; i=$((i+1)); done
+  printf "  %sb) back%s\n  > " "$D" "$N"; read -r sel
+  [[ "$sel" == "b" || -z "$sel" ]] && return
+  if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#opts[@]} )); then
+    run "Expression: ${opts[$((sel-1))]}" python scripts/ctl-express.py express "${opts[$((sel-1))]}"
+  else warn "no such option"; fi
+}
+
+a_snap() {
+  run "Photo from Peachy's camera (WebRTC)" python scripts/cam-snap.py --open
+}
+
+a_calibrate() {
+  warn "Calibration MOVES the robot through wake → sleep to record real poses."
+  confirm "Run calibration now?" || { warn "skipped"; return; }
+  run "Calibrate sleep/wake poses" python scripts/ctl-toggle.py calibrate
+}
+
+a_head_jog() {
+  warn "Interactive head-jog REPL: type 'deg' first, then 'r/p/y N' to nudge,"
+  warn "'ant N' to raise the antenna plumb line, 'save' to persist, 'q' to quit."
+  warn "You MUST type 'save' before 'q' for the offset to stick."
+  confirm "Launch the head-jog REPL?" || { warn "skipped"; return; }
+  python scripts/cal-head.py --from-saved
+}
+
+a_watch_dry() { run "Room watch — DRY RUN (sensors only, no movement)" python scripts/watch-room.py --dry-run; }
+a_watch_live(){
+  warn "Live room watch: robot will actually move on state transitions."
+  warn "Ctrl+C to stop. Needs calibration done (see option 7)."
+  confirm "Start live room watch?" || { warn "skipped"; return; }
+  python scripts/watch-room.py
+}
+
+a_convo_start() { run "Wake + start conversation app" scripts/app-conversation.sh start; }
+a_convo_stop()  { run "Stop conversation app + sleep" scripts/app-conversation.sh stop && python scripts/ctl-toggle.py sleep; }
+
+a_dashboard() { run "Start the dashboard (http://localhost:8080)" ./run.sh --restart; }
+
+a_diag_yaw() {
+  warn "Body-yaw diagnostic: small moves on head + body yaw, reads encoders."
+  confirm "Run yaw probe?" || { warn "skipped"; return; }
+  run "Body-yaw mechanical/electrical diagnostic" python scripts/diag-yaw.py
+}
+
+# ─── main menu loop ───────────────────────────────────────────────────────
+
+menu() {
+  printf '\n%s  P E A C H Y   C O N T R O L   D E C K  %s\n' "$B$M" "$N"
+  bar
+  printf '  %sSTATUS%s\n' "$B" "$N"
+  printf '   1) Connection check + robot status\n'
+  printf '  %sCONTROL%s\n' "$B" "$N"
+  printf '   2) Wake          3) Sleep          4) Toggle (smart)\n'
+  printf '   5) Expression…\n'
+  printf '  %sBEHAVIOR%s\n' "$B" "$N"
+  printf '   6) Room watch — dry-run (safe, no movement)\n'
+  printf '   7) Room watch — LIVE  (the dream)\n'
+  printf '  %sCAMERA / TUNING%s\n' "$B" "$N"
+  printf '   8) Take a photo\n'
+  printf '   9) Calibrate sleep/wake poses  (moves robot)\n'
+  printf '  10) Center head — interactive jog (must "save")\n'
+  printf '  %sCONVERSATION APP%s\n' "$B" "$N"
+  printf '  11) Wake + start conversation     12) Stop conversation + sleep\n'
+  printf '  %sDASHBOARD%s\n' "$B" "$N"
+  printf '  13) Start the dashboard\n'
+  printf '  %sADVANCED%s\n' "$B" "$N"
+  printf '  14) Body-yaw diagnostic\n\n'
+  printf '   q) Quit\n'
+  bar
+  printf '  > '
+}
+
+while true; do
+  menu
+  read -r choice || break
+  case "$choice" in
+    1) a_status ;;
+    2) a_wake ;;
+    3) a_sleep ;;
+    4) a_toggle ;;
+    5) a_express ;;
+    6) a_watch_dry ;;
+    7) a_watch_live ;;
+    8) a_snap ;;
+    9) a_calibrate ;;
+    10) a_head_jog ;;
+    11) a_convo_start ;;
+    12) a_convo_stop ;;
+    13) a_dashboard ;;
+    14) a_diag_yaw ;;
+    q|Q|"") echo; ok "bye"; exit 0 ;;
+    *) warn "no such option: $choice" ;;
+  esac
+  pause
+done

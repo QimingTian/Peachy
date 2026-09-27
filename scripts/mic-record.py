@@ -9,7 +9,7 @@ Writes .run/mic/<label>.wav (16 kHz mono int16) and <label>.json: level per
 second, 100 ms block percentiles, band levels, tonal peaks and the chip's AGC
 gain sampled every second; a label is overwritten when recorded again.
 --compare prints how far a recording sits above the baseline, per band. Audio comes over its own receive-only WebRTC stream, so the
-conversation app and wake word keep running.
+conversation app keeps running.
 """
 
 from __future__ import annotations

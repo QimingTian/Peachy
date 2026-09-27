@@ -22,6 +22,41 @@ def _http(host: str, port: int, path: str, method: str, timeout: float,
         return json.loads(raw) if raw else {}
 
 
+def stop_moves(host: str, port: int) -> int:
+    """Stop every running move (POST /api/move/stop takes one move's uuid; a bare
+    call is rejected with 422). Returns how many it stopped."""
+    n = 0
+    try:
+        running = _http(host, port, "/api/move/running", "GET", 4.0) or []
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+        return 0
+    for move in running if isinstance(running, list) else []:
+        uuid = move.get("uuid") if isinstance(move, dict) else move
+        try:
+            _http(host, port, "/api/move/stop", "POST", 6.0, body={"uuid": uuid})
+            n += 1
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+            pass
+    return n
+
+
+def wait_app_reset(host: str, port: int, max_s: float = 12.0) -> bool:
+    """Call right after stopping an app. 1.5 s after an app exits the daemon puts
+    the robot to sleep on its own (lift, sleep pose, motors off), and moves sent
+    meanwhile are ignored or undone. Waits for that to end; True if it did."""
+    time.sleep(2.0)
+    deadline = time.time() + max_s
+    while time.time() < deadline:
+        try:
+            if _http(host, port, "/api/motors/status", "GET", 4.0).get("mode") == "disabled":
+                time.sleep(0.3)
+                return True
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+            pass
+        time.sleep(0.3)
+    return False
+
+
 def motion_actuates(host: str, port: int, *, threshold: float = 0.012) -> bool:
     """True if the move queue accepts and runs a tiny head goto."""
     try:

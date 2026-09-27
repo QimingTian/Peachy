@@ -10,9 +10,9 @@
 Frames go to .run/light_samples/<label>/, one row per frame in samples.jsonl
 (brightness stats + head pitch + body yaw). The console must be running: it
 owns Dozing and body turns. The camera's auto-exposure is left alone, so the
-numbers are what room watch will see. Room watch (sense-live.py --watch) reads
-its dark/lit thresholds from the dark and lit samples nearest PEACHY_DOZE_DEG;
-restart it after new captures.
+numbers are what room watch will see (the robot's own camera reads within 2%).
+Room watch takes its dark/lit thresholds from the dark and lit samples nearest
+PEACHY_DOZE_DEG; the console pushes new ones to the robot within seconds.
 """
 
 from __future__ import annotations

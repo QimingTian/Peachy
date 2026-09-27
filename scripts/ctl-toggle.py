@@ -81,6 +81,20 @@ def _enable(host: str, port: int) -> None:
     _http(host, port, "/api/motors/set_mode/enabled", "POST", 10.0)
 
 
+def _wake_up(host: str, port: int) -> None:
+    """play/wake_up, after bringing the body round to 0 first: Asleep faces the
+    Dozing direction, and wake_up ends at body 0 in a move timed for the head."""
+    from sleep_gentle import turn_body
+
+    def http(path: str, method: str, body: dict | None = None, timeout: float = 10.0):
+        return _http(host, port, path, method, timeout, body)
+
+    _enable(host, port)                       # else wake_up won't actuate
+    live = _http(host, port, "/api/state/full?with_head_pose=true&with_body_yaw=true", "GET", 5.0)
+    turn_body(http, dict(live.get("head_pose") or {}), float(live.get("body_yaw") or 0.0), 0.0)
+    _play(host, port, "wake_up")
+
+
 def _wait_move_done(host: str, port: int, max_s: float = 18.0) -> None:
     """Poll /api/move/running until empty (or timeout). `play/wake_up` returns
     its UUID immediately and the canned animation runs ASYNC — issuing another
@@ -129,13 +143,13 @@ def _settle_centered(host: str, port: int, fdata: dict, dur: float = 0.8) -> Non
 
 
 # How to sleep, via REACHY_SLEEP_MODE:
-#   gravcomp (default) — hold the asleep pose (antennae+head DOWN) with
-#                        gravity-compensation: low torque, quiet, pose kept.
+#   limp (default)     — cut torque once the droop is done: silent, no wear,
+#                        but antennae spring back UP and head relaxes.
+#   gravcomp           — hold the pose with gravity compensation (needs the
+#                        daemon's Placo kinematics; this robot falls back to hold).
 #   hold               — keep motors enabled holding the pose (firmest;
 #                        loudest if it whines).
-#   limp               — release the move + cut torque: silent, zero wear,
-#                        but antennae spring back UP and head relaxes.
-_SLEEP_MODE = os.environ.get("REACHY_SLEEP_MODE", "gravcomp").strip().lower()
+_SLEEP_MODE = os.environ.get("REACHY_SLEEP_MODE", "limp").strip().lower()
 
 
 def _true_sleep(host: str, port: int, fdata: dict) -> str:
@@ -157,13 +171,33 @@ def _load_file() -> dict:
         return {}
 
 
-def _save_file(data: dict) -> None:
+def _save_file(data: dict, host: str | None = None) -> None:
     _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _STATE_FILE.write_text(json.dumps(data, indent=2) + "\n")
+    if host and data.get("state"):
+        _tell_robot(host, data["state"])
+
+
+def _tell_robot(host: str, state: str) -> None:
+    """The robot's routine (robot/peachy_senses.py) keeps the state too. Best effort."""
+    try:
+        tok = (_REPO / ".run" / "senses_token").read_text().strip()
+    except OSError:
+        return
+    req = urllib.request.Request(f"http://{host}:8767/state", method="POST",
+                                 data=json.dumps({"state": state}).encode(),
+                                 headers={"Content-Type": "application/json", "X-Peachy-Senses": tok})
+    try:
+        urllib.request.urlopen(req, timeout=3).read()
+    except (urllib.error.URLError, OSError):
+        pass
 
 
 def _release_for_motion(host: str, port: int) -> str:
     """Conversation app holds the SDK — stop it before wake/sleep."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from motion_ready import ensure_motion_ready, stop_moves, wait_app_reset
+
     notes: list[str] = []
     convo = _REPO / "scripts" / "app-conversation.sh"
     if convo.is_file():
@@ -173,15 +207,10 @@ def _release_for_motion(host: str, port: int) -> str:
             subprocess.run([str(convo), "stop"], cwd=_REPO,
                          capture_output=True, text=True, timeout=25)
             notes.append("conversation stopped")
-            time.sleep(1.8)
-    try:
-        _http(host, port, "/api/move/stop", "POST", 6.0)
-    except SystemExit:
-        pass
+            wait_app_reset(host, port)
+    stop_moves(host, port)
     _enable(host, port)
     time.sleep(0.25)
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from motion_ready import ensure_motion_ready
 
     revived = ensure_motion_ready(host, port)
     if revived:
@@ -218,8 +247,7 @@ def _do(host: str, port: int, target: str, fdata: dict) -> None:
     else:
         move = "wake_up"
         print(f"→ {move} @ {host}:{port} (this can take a few seconds)…")
-        _enable(host, port)                   # else wake_up won't actuate
-        _play(host, port, move)
+        _wake_up(host, port)
         _wait_move_done(host, port)
         _settle_centered(host, port, fdata)   # apply head_offset (play/wake_up
                                               # itself ignores it → drift)
@@ -232,7 +260,7 @@ def _do(host: str, port: int, target: str, fdata: dict) -> None:
     fdata["state"] = target
     fdata["last_move"] = move
     fdata["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    _save_file(fdata)
+    _save_file(fdata, host)
     print(f"✓ now: {target}  (saved → {_STATE_FILE.relative_to(_REPO)})")
 
 
@@ -284,7 +312,7 @@ def main() -> int:
             _enable(host, port)
             if fdata.get("state") != "awake":
                 print("→ wake_up …")
-                _play(host, port, "wake_up")
+                _wake_up(host, port)
                 time.sleep(3.0)
             print("→ goto_sleep …")
             _play(host, port, "goto_sleep")
@@ -300,15 +328,14 @@ def main() -> int:
             }
             fdata["state"] = "asleep"
             fdata["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            _save_file(fdata)
+            _save_file(fdata, host)
             print(f"✓ sleep calibrated. z={hp.get('z'):+.4f}  pitch={hp.get('pitch'):+.4f} rad")
             print("  Run `sleep` to preview; set REACHY_SLEEP_LOWER_MM=0 to skip z tweak.")
             return 0
 
         print("Calibration moves the robot. It will wake, then sleep.")
-        _enable(host, port)                   # else the moves are no-ops
         print("→ wake_up …")
-        _play(host, port, "wake_up")
+        _wake_up(host, port)
         time.sleep(3.0)                       # canned moves take ~2.5s
         wake_state = _get_state(host, port)
         print("→ goto_sleep …")
@@ -325,7 +352,7 @@ def main() -> int:
                                          "antennas": sleep_state.get("antennas_position")}
         fdata["state"] = "asleep"
         fdata["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        _save_file(fdata)
+        _save_file(fdata, host)
         wz = wake_state["head_pose"]["z"]
         sz = sleep_hp["z"]
         print(f"✓ calibrated. wake z={wz:+.4f}  sleep z={sz:+.4f}  Δ={wz - sz:+.4f} m")

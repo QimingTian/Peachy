@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stop Peachy automation — one command when too many things are running.
 #
-#   ./scripts/tool-stop-all.sh           # halt moves, conversation, senses (incl. room watch)
+#   ./scripts/tool-stop-all.sh           # halt moves, conversation, senses (room watch, Follow, wake word)
 #   ./scripts/tool-stop-all.sh --sleep   # same + gentle sleep
 #
 # Does not stop the dashboard or the robot daemon.
@@ -32,16 +32,14 @@ if [ -f "${RUN}/sense_config.json" ]; then
 import json, sys
 p = sys.argv[1]
 cfg = json.load(open(p))
-cfg.update(follow=False, wake=False, watch=False)
+cfg.update(follow=False, watch=False, wake=False)
 json.dump(cfg, open(p, "w"))
 EOF
 fi
-if [ -f "${RUN}/sense_live.pid" ]; then
-  pid="$(cat "${RUN}/sense_live.pid" 2>/dev/null || true)"
-  if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-    kill "${pid}" 2>/dev/null || true
-    msgs+=("senses stopped")
-  fi
+if [ -s "${RUN}/senses_token" ]; then
+  curl -sf -m4 -X POST "http://${HOST}:8767/config" -H "Content-Type: application/json" \
+    -H "X-Peachy-Senses: $(cat "${RUN}/senses_token")" -d '{"follow": false, "watch": false, "wake": false}' >/dev/null 2>&1 \
+    && msgs+=("robot senses off") || true
 fi
 
 if "${ROOT}/scripts/app-conversation.sh" stop 2>/dev/null || true; then

@@ -7,4 +7,3 @@ uvicorn
 qrcode
 Pillow
 websockets
-faster-whisper

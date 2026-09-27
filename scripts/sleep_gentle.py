@@ -6,9 +6,10 @@ gotos (not streamed set_target) so sleep stays fast over slow links.
 
 Order:
   1. Random Portal-turret farewell line (goodnight, shutting down, …)
+  1b. Body to the Dozing direction (PEACHY_DOZE_DEG), the head turning with it
   2. Smooth droop — left/right antennae at different rates; head pans down after
   3. Classic ``go_sleep.wav`` snore once settled
-  4. Motor mode per ``REACHY_SLEEP_MODE`` (gravcomp default; falls back to hold)
+  4. Motor mode per ``REACHY_SLEEP_MODE`` (limp default: motors off)
 
 Env:
   REACHY_SLEEP_DUR      total motion seconds (default 2.8)
@@ -20,6 +21,7 @@ Env:
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import time
@@ -53,7 +55,7 @@ _WAKE_GREET = os.environ.get("REACHY_WAKE_GREET", "1").lower() not in ("0", "fal
 # Keyframe times along the move (0..1); three minjerk segments.
 _KEYFRAME_U = (0.38, 0.72, 1.0)
 
-_SLEEP_MODE = os.environ.get("REACHY_SLEEP_MODE", "gravcomp").strip().lower()
+_SLEEP_MODE = os.environ.get("REACHY_SLEEP_MODE", "limp").strip().lower()
 _GENTLE = os.environ.get("REACHY_SLEEP_GENTLE", "1").lower() not in ("0", "false", "off")
 _SLEEP_DUR = float(os.environ.get("REACHY_SLEEP_DUR", "2.8"))
 _ANT_R_LAG = float(os.environ.get("REACHY_SLEEP_ANT_LAG", "0.12"))
@@ -135,7 +137,8 @@ def settle_asleep(http: HttpFn) -> None:
     the pose is still held (same as REACHY_SLEEP_MODE=hold).
     """
     if _SLEEP_MODE == "limp":
-        steps = ("/api/move/stop", "/api/motors/set_mode/disabled")
+        wait_move_done(http)
+        steps = ("/api/motors/set_mode/disabled",)
     elif _SLEEP_MODE == "hold":
         steps = ("/api/motors/set_mode/enabled",)
     else:
@@ -202,6 +205,42 @@ def _interp_pose(cur_hp: dict, cur_ant: list[float],
     return hp, ant
 
 
+def doze_body() -> float:
+    """Robot body_yaw of the Dozing direction (PEACHY_DOZE_DEG); Asleep faces it too."""
+    import sys
+
+    sys.path.insert(0, str(_REPO / "scripts"))
+    import heading
+    from senses_cfg import DOZE_DEG
+
+    return heading.enc_rad(DOZE_DEG)
+
+
+def rotated(head_pose: dict, angle: float) -> dict:
+    """*head_pose* (base frame) turned about the vertical by *angle*, position too:
+    the same pose relative to a body turned that much."""
+    x, y = float(head_pose.get("x", 0.0)), float(head_pose.get("y", 0.0))
+    c, s = math.cos(angle), math.sin(angle)
+    return {**head_pose, "x": c * x - s * y, "y": s * x + c * y,
+            "yaw": float(head_pose.get("yaw", 0.0)) + angle}
+
+
+def turn_body(http: HttpFn, head_pose: dict, body_from: float, body_to: float) -> dict:
+    """Turn the body, the head turning with it. Returns the head pose it ends at."""
+    delta = body_to - body_from
+    if abs(delta) < math.radians(3):
+        return head_pose
+    hp = rotated(head_pose, delta)
+    dur = max(1.2, abs(delta) / math.radians(60))
+    wait_move_done(http)
+    http("/api/move/goto", "POST",
+         {"head_pose": hp, "body_yaw": body_to, "duration": dur, "interpolation": "minjerk"},
+         timeout=dur + 15.0)
+    time.sleep(dur + 0.2)
+    wait_move_done(http)
+    return hp
+
+
 def _smooth_droop(http: HttpFn, cur_hp: dict, cur_ant: list[float],
                   sleep_hp: dict, sleep_ant: list[float], duration: float) -> None:
     """Three minjerk gotos — left antenna leads, right lags, head follows."""
@@ -240,14 +279,20 @@ def gentle_sleep(http: HttpFn, host: str, port: int, *,
         settle_asleep(http)
         return "goto_sleep"
 
-    live = http("/api/state/full", "GET", timeout=8.0)
+    live = http("/api/state/full?with_head_pose=true&with_body_yaw=true", "GET", timeout=8.0)
     cur_hp = dict(live.get("head_pose") or sleep_hp)
     cur_ant = list(live.get("antennas_position") or sleep_ant)
+    body = doze_body()
+    sleep_hp = rotated(sleep_hp, body)      # calibrated at body 0
 
     farewell = _play_farewell(http, host, port)
     if farewell:
         time.sleep(0.25)
 
+    try:
+        cur_hp = turn_body(http, cur_hp, float(live.get("body_yaw") or 0.0), body)
+    except BaseException:
+        pass
     _smooth_droop(http, cur_hp, cur_ant, sleep_hp, sleep_ant, _SLEEP_DUR)
     wait_move_done(http)
     _play_snore(http)

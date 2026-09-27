@@ -28,6 +28,7 @@ restart_if_running() {
     ./scripts/app-conversation.sh stop >/dev/null
     sleep 3
     ./scripts/app-conversation.sh start
+    "${SSH[@]}" "curl -s -m 5 -X POST -H 'Content-Type: application/json' -d '{}' localhost:8000/api/motors/set_mode/enabled >/dev/null" || true
   fi
 }
 

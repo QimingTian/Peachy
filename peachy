@@ -74,12 +74,12 @@ a_head_jog() {
   python scripts/cal-head.py --from-saved
 }
 
-a_watch_dry() { run "Room watch — DRY RUN (sensors only, no movement)" python scripts/sense-live.py --watch --dry-run; }
+a_watch_dry() { run "Robot senses — status (state, room watch, Follow)" scripts/sense-robot.sh status; }
 a_watch_live(){
-  warn "Live room watch: dozes by day, looks around when the lights come on."
-  warn "Needs the dashboard running (option 13); its Room watch switch does the same."
-  confirm "Start live room watch?" || { warn "skipped"; return; }
-  python scripts/sense-live.py --watch
+  warn "Installs state, room watch and Follow on the robot (systemd peachy-senses)."
+  warn "They run there with this laptop off; the console's switches turn them on and off."
+  confirm "Install / restart the robot senses?" || { warn "skipped"; return; }
+  scripts/sense-robot.sh install
 }
 
 a_convo_start() { run "Wake + start conversation app" scripts/app-conversation.sh start; }
@@ -104,8 +104,8 @@ menu() {
   printf '   2) Wake          3) Sleep          4) Toggle (smart)\n'
   printf '   5) Expression…\n'
   printf '  %sBEHAVIOR%s\n' "$B" "$N"
-  printf '   6) Room watch — dry-run (safe, no movement)\n'
-  printf '   7) Room watch — LIVE\n'
+  printf '   6) Robot senses — status\n'
+  printf '   7) Robot senses — install / restart\n'
   printf '  %sCAMERA / TUNING%s\n' "$B" "$N"
   printf '   8) Take a photo\n'
   printf '   9) Calibrate sleep/wake poses  (moves robot)\n'

@@ -306,10 +306,6 @@ canvas.scope{height:72px}
 .conv-top{padding:18px 18px 14px;border-bottom:1px solid var(--line)}
 .conv-state{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:12px}
 .conv-state.on{color:var(--live)}
-.wake-row{display:flex;align-items:center;gap:10px;margin-top:12px}
-.wake-row b{font-weight:500}
-.wake-state{flex:1;min-width:0;font:11px var(--mono);color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.wake-state.hot{color:var(--live)}
 .talk{flex:1;min-height:0;display:flex;flex-direction:column;padding:14px 18px}
 .talk-head{display:flex;align-items:center;gap:12px}
 .talk-state{flex:1;display:flex;align-items:baseline;gap:10px}
@@ -457,6 +453,34 @@ dialog .actions{justify-content:flex-end;margin-top:20px}
 
     <section class="block">
       <div class="row-head">
+        <h2>Avatar</h2>
+        <button class="switch" id="apSwitch" role="switch" aria-checked="false" aria-label="Peachy as your avatar: head follows your AirPods, your voice on its speaker, its ears in your AirPods" data-need="robot"></button>
+      </div>
+      <div class="light-read">
+        <span class="lamp" id="apLamp"></span>
+        <b id="apTxt">Off</b>
+        <span class="mono" id="apNums"></span>
+      </div>
+      <div class="row" id="apRow" hidden>
+        <button class="btn sm" id="apCenter" data-need="robot" title="Face where Peachy should look straight ahead, then press">Recenter</button>
+        <button class="btn sm quiet" id="apLevel" data-need="robot" title="Press, then within 3 s look level at the horizon and hold for 1 s — measures how the AirPods sit in your ears (saved)">Set level</button>
+        <span class="dim" id="apInfo"></span>
+      </div>
+    </section>
+
+    <section class="block">
+      <div class="row-head">
+        <h2>Hey Peachy</h2>
+        <button class="switch" id="wkSwitch" role="switch" aria-checked="false" aria-label="Wake on “Hey Peachy”" data-need="robot"></button>
+      </div>
+      <div class="light-read">
+        <span class="lamp" id="wkLamp"></span>
+        <b id="wkTxt">Off</b>
+      </div>
+    </section>
+
+    <section class="block">
+      <div class="row-head">
         <h2>Microphone</h2>
         <button class="switch" id="micSwitch" role="switch" aria-checked="false" aria-label="Microphone scope" data-need="robot"></button>
       </div>
@@ -547,11 +571,6 @@ dialog .actions{justify-content:flex-end;margin-top:20px}
           <span class="conv-state" id="convState"><span class="dot"></span><span>Off</span></span>
         </div>
         <button class="btn primary block" id="btnConv" data-need="robot idle" style="margin-top:8px;height:34px">Start conversation</button>
-        <div class="wake-row">
-          <b>Hi Peachy</b>
-          <span class="wake-state" id="wkState"></span>
-          <button class="switch" id="wkSwitch" role="switch" aria-checked="false" aria-label="Start on “Hi Peachy”" data-need="robot"></button>
-        </div>
       </div>
       <div class="talk">
         <div class="talk-head">
@@ -851,6 +870,7 @@ function renderStatus(rtt){
   if(!up) haltLiveLocal();
   syncTwin();
   if(st.sense){S.sense={...(S.sense||{}),...st.sense};renderSense(S.sense);}
+  renderAirpods(up?st.airpods:null);
 
   const tr=$("#tRtt");
   if(S.serverUp&&rtt!=null){tr.textContent=rtt+" ms";tr.className=rtt>1500?"warn":"";}
@@ -992,33 +1012,40 @@ $("#btnResetView").addEventListener("click",()=>{if(S.twin) S.twin.resetView();}
 window.addEventListener("beforeunload",()=>rtc.stop(true));
 
 const PAUSED={asleep:"Asleep",conversation:"Conversation running",app:"App running",move:"Moving",busy:"Busy",
-  offline:"Robot offline","motors off":"Motors off",yielding:"Paused",starting:"Starting",cooldown:"Starting conversation","no audio":"No audio",speaker:"Peachy is speaking",settling:"Waiting for quiet"};
+  offline:"Robot offline","motors off":"Motors off","no daemon state":"Robot offline",yielding:"Paused",starting:"Starting",
+  acting:"Busy",looking:"Looking around",cooldown:"Waking up","no model":"No wake word model on the robot"};
 function renderSense(s){
-  s=s||{}; const live=s.live||{}, f=live.follow, w=live.wake;
+  s=s||{}; const live=s.live||{}, f=live.follow;
   $("#fwSwitch").setAttribute("aria-checked",s.follow?"true":"false");
-  $("#wkSwitch").setAttribute("aria-checked",s.wake?"true":"false");
   let txt="Off", lamp="";
   if(s.follow){
     const st=(f&&f.status)||"";
-    if(!s.running||!f) {txt="Starting";lamp="idle";}
-    else if(live.media==="error") txt="No camera stream";
+    if(!s.running) txt="Robot senses offline";
+    else if(!f) {txt="Starting";lamp="idle";}
     else if(st==="tracking"){txt=f.faces>1?`Tracking 1 of ${f.faces}`:"Tracking";lamp="track";}
-    else if(st==="voice"){txt="Turning to a voice";lamp="track";}
     else if(st==="watching"||st==="waiting"){txt="Looking";lamp="idle";}
     else if(st.startsWith("paused:")) txt=PAUSED[st.slice(7)]||"Paused";
     else txt=humanize(st);
   }
   $("#fwTxt").textContent=txt; $("#fwLamp").className="lamp"+(lamp?" "+lamp:"");
-  const ws=$("#wkState"); let wt="", hot=false;
+  renderWake(s);
+  renderWatch(s);
+}
+function renderWake(s){
+  const w=(s.live||{}).wake;
+  $("#wkSwitch").setAttribute("aria-checked",s.wake?"true":"false");
+  let txt="Off", lamp="";
   if(s.wake){
     const st=(w&&w.status)||"";
-    if(!s.running||!w) wt="Starting";
-    else if(w.heard_at&&Date.now()/1000-w.heard_at<12){wt="Heard";hot=true;}
-    else if(st.startsWith("paused:")) wt=PAUSED[st.slice(7)]||"Paused";
-    else wt="Listening";
+    if(!s.running) txt="Robot senses offline";
+    else if(!w) {txt="Starting";lamp="idle";}
+    else if(w.heard_at&&Date.now()/1000-w.heard_at<12){txt="Heard “Hey Peachy”";lamp="track";}
+    else if(st==="listening"){txt=w.hot?"Listening — hearing sound":"Listening";lamp="idle";}
+    else if(st==="settling") txt="Waiting for quiet";
+    else if(st.startsWith("paused:")) txt=PAUSED[st.slice(7)]||"Paused";
+    else txt=humanize(st);
   }
-  ws.textContent=wt; ws.classList.toggle("hot",hot);
-  renderWatch(s);
+  $("#wkTxt").textContent=txt; $("#wkLamp").className="lamp"+(lamp?" "+lamp:"");
 }
 function drawFaces(){
   const box=$("#faces"), f=S.sense&&S.sense.live&&S.sense.live.follow;
@@ -1040,9 +1067,56 @@ async function toggleSense(feature,sw){
   if(d.ok===false) notice(lastLine(d.msg)||"Didn’t start","err");
   pollSense(); pollLog();
 }
+const AP_TXT={following:"Following your head","no AirPods":"Waiting for AirPods","AirPods connecting":"Connecting",
+  "AirPods gone, holding":"AirPods out — holding","AirPods gone, home":"AirPods out — head home",paused:"Paused",
+  stopping:"Gliding home",starting:"Starting",leveling:"Hold level…"};
+const sdeg=v=>(v<0?"−":"+")+Math.abs(v).toFixed(0)+"°";
+function renderAirpods(a){
+  a=a||{}; const l=a.live||{}, st=l.status||"starting";
+  $("#apSwitch").setAttribute("aria-checked",a.on?"true":"false");
+  $("#apRow").hidden=!a.on;
+  let txt="Off", lamp="", nums="", info="";
+  if(a.on){
+    const lv=/^level in (\d+)/.exec(st);
+    txt=lv?`Look level at the horizon — ${lv[1]}`:(AP_TXT[st]||humanize(st));
+    lamp=st==="following"?"track":"idle";
+    const h=l.head;
+    if(h&&st==="following") nums=`yaw ${sdeg(h.yaw)} pitch ${sdeg(h.pitch)} roll ${sdeg(h.roll)}`;
+    if(h&&Math.abs(h.body)>=1) info=`body ${sdeg(h.body)} · `;
+    if(l.hz_in!=null) info+=`${l.hz_in}→${l.hz_out} Hz · ${l.age_ms??"—"} ms · ${l.via||""}`;
+    if(l.level) info+=(l.level.pitch||l.level.roll)?` · level ${sdeg(l.level.pitch)}/${sdeg(l.level.roll)}`:" · level not set";
+    if(l.audio) info+=l.audio==="error"?` · audio: ${l.audio_err||"error"}`:` · audio ${l.audio}`;
+  } else if(a.err) txt=a.err;
+  $("#apTxt").textContent=txt; $("#apLamp").className="lamp"+(lamp?" "+lamp:"");
+  $("#apNums").textContent=nums; $("#apInfo").textContent=info;
+}
+async function pollAirpods(){
+  const d=await api("/api/airpods",{timeout:4000});
+  if(d.ok===false) return;
+  if(S.st) S.st.airpods=d;
+  renderAirpods(d);
+}
+$("#apSwitch").addEventListener("click",async()=>{
+  const sw=$("#apSwitch"), on=sw.getAttribute("aria-checked")==="true";
+  sw.setAttribute("aria-checked",on?"false":"true");
+  notice(on?"Ending the avatar":"Starting the avatar","work");
+  const d=await post(`/api/airpods/${on?"off":"on"}`,{timeout:60000});
+  if(d.ok===false) notice(lastLine(d.msg)||"Didn’t start","err");
+  else notice(on?"Avatar ended — Peachy stays awake":"Peachy is your avatar — face where it should look ahead","ok");
+  pollStatus(); pollLog();
+});
+$("#apCenter").addEventListener("click",async()=>{
+  const d=await post("/api/airpods/recenter",{timeout:5000});
+  notice(d.ok===false?lastLine(d.msg)||"Recenter failed":"Recentered — this way is straight ahead",d.ok===false?"err":"ok");
+});
+$("#apLevel").addEventListener("click",async()=>{
+  const d=await post("/api/airpods/level",{timeout:5000});
+  notice(d.ok===false?lastLine(d.msg)||"Set level failed":"Look up: level at the horizon in 3 s, hold 1 s",d.ok===false?"err":"ok");
+  pollAirpods();
+});
 $("#fwSwitch").addEventListener("click",()=>toggleSense("follow",$("#fwSwitch")));
-$("#wkSwitch").addEventListener("click",()=>toggleSense("wake",$("#wkSwitch")));
 $("#rwSwitch").addEventListener("click",()=>toggleSense("watch",$("#rwSwitch")));
+$("#wkSwitch").addEventListener("click",()=>toggleSense("wake",$("#wkSwitch")));
 
 const YMIN=-160,YMAX=160;
 const pct=deg=>(deg-YMIN)/(YMAX-YMIN)*100;
@@ -1337,7 +1411,8 @@ function renderWatch(s){
   if(!on) S.rwLevel=null;
   else if(w&&(w.level||w.last_level)) S.rwLevel=w.level||w.last_level;
   let txt="Off", lamp="";
-  if(on){
+  if(on&&!s.running) txt="Robot senses offline";
+  else if(on){
     txt=S.rwLevel==="lit"?"Light on":S.rwLevel==="dark"?"Light off":"—";
     lamp=S.rwLevel==="lit"?"lit":S.rwLevel==="dark"?"idle":"";
   }
@@ -1767,7 +1842,8 @@ every(15000,pollFan);
 every(3000,()=>{ if(S.st&&S.st.daemon){ loadBody(); loadHead(); } if(S.sheet) loadHeading(); });
 setTimeout(()=>{loadConvLists();loadSounds();loadVolume();loadApps();loadMoves();},300);
 every(30000,()=>{ if(S.st&&S.st.daemon) loadApps(); });
-setInterval(()=>{ const s=S.sense; if(!document.hidden&&s&&(s.follow||s.wake||s.watch)) pollSense(); },1000);
+setInterval(()=>{ const s=S.sense; if(!document.hidden&&s&&(s.follow||s.watch||s.wake)) pollSense(); },1000);
+setInterval(()=>{ const a=S.st&&S.st.airpods; if(!document.hidden&&a&&a.on) pollAirpods(); },250);
 window.addEventListener("resize",()=>{drawSpark();drawMic();drawFaces();});
 </script>
 </body>

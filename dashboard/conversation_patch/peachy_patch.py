@@ -32,6 +32,7 @@ import json
 import math
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -209,35 +210,162 @@ def _blend_head(app_head, held: np.ndarray) -> np.ndarray:
     return out
 
 
-# Daemon-side face tracking (1.11+) at weight 1 discards the app's head target
-# entirely, so a held pose needs it off. Remember what the app asked for and
-# restore that when the mode goes back to free.
-_track: dict = {"weight": None, "suspended": False}
+# Face tracking, alt-azimuth. The app's head_tracking tool would turn on the
+# daemon's tracker, which at weight 1 discards the app's head target (held body
+# yaw included, so the neck twists when the body turns), rolls with the face,
+# and runs at the lowest priority: 3-4 detections a second on the busy CM4.
+# It stays off. The patch finds faces itself instead, with the same YuNet model
+# at normal priority on the app's own camera frames (~38 ms each, run at
+# _FACE_HZ), and aims: yaw about the vertical, pitch in the head frame, and the
+# body takes over when the head is turned far. Dozing, or the console turning
+# the body, ends tracking and forgets the request, so waking does not bring
+# back one from before.
+_FACE_HZ = 10.0
+_FACE_W = 320
+_FOCAL_N = 1.27            # focal / half image width (cal-heading fit: 405 px at 640)
+_ASPECT = 16 / 9
+_AIM_LAG = 0.15            # s, camera + detection; aim from where the head was then
+_AIM_GAIN = 0.7
+_AIM_DEAD = math.radians(2)
+_AIM_HEAD_MAX = math.radians(40)    # head yaw vs body
+_AIM_PITCH_MAX = math.radians(25)
+_AIM_LOST_S = 4.0
+_AIM_SMOOTH = 6.0                   # 1/s, head easing toward the aim
+_AIM_BODY_AT = math.radians(18)     # head this far off the body for _AIM_BODY_S...
+_AIM_BODY_S = 0.8
+_AIM_BODY_STEP = math.radians(8)    # ...moves the body up to this much toward it
+_track: dict = {"weight": None, "suspended": False, "body_yaw": None}
+# az / body: head azimuth and body direction, offsets from the held yaw.
+_aim: dict = {"on": False, "robot": None, "ts": None, "seen": 0.0, "at": 0.0, "off_since": 0.0,
+              "az": 0.0, "taz": 0.0, "pitch": 0.0, "tpitch": 0.0, "body": 0.0, "tbody": 0.0}
+_aim_hist: deque = deque(maxlen=120)   # (t, az, pitch), last ~1.2 s
+
+
+def _clip(v: float, lim: float) -> float:
+    return max(-lim, min(lim, v))
+
+
+def _pick_face(faces, w: int, h: int, prev: tuple[float, float] | None) -> tuple[float, float] | None:
+    """Nose of the face to follow, in [-1, 1] of the image: the one near the last
+    pick if it is still there, else the largest."""
+    if not faces:
+        return None
+    nose = [(f.nose[0] / max(w - 1, 1) * 2 - 1, f.nose[1] / max(h - 1, 1) * 2 - 1) for f in faces]
+    if prev is not None:
+        i = min(range(len(faces)), key=lambda k: (nose[k][0] - prev[0]) ** 2 + (nose[k][1] - prev[1]) ** 2)
+        if abs(nose[i][0] - prev[0]) < 0.36:
+            return nose[i]
+    return nose[max(range(len(faces)), key=lambda k: faces[k].bbox[2] * faces[k].bbox[3])]
+
+
+def _face_loop() -> None:
+    det = None
+    prev = None
+    while True:
+        robot = _aim["robot"]
+        if not _aim["on"] or robot is None:
+            prev = None
+            time.sleep(0.2)
+            continue
+        t0 = time.monotonic()
+        try:
+            if det is None:
+                import cv2
+                from reachy_mini.vision.face_detector import FaceDetector
+                det = FaceDetector()
+            frame = robot.media.get_frame()
+            if frame is not None:
+                h, w = frame.shape[:2]
+                small = cv2.resize(frame, (_FACE_W, round(_FACE_W * h / w / 2) * 2),
+                                   interpolation=cv2.INTER_AREA)
+                prev = _pick_face(det.detect(small), small.shape[1], small.shape[0], prev)
+                if prev is not None:
+                    _aim_see({"detected": True, "x": prev[0], "y": prev[1], "ts": t0})
+        except Exception:  # noqa: BLE001 - a camera hiccup must not end tracking for good
+            time.sleep(1.0)
+        time.sleep(max(0.0, 1.0 / _FACE_HZ - (time.monotonic() - t0)))
+
+
+def _aim_then(t: float) -> tuple[float, float]:
+    """Head azimuth and pitch offsets at time t (monotonic). Caller holds _lock."""
+    for at, az, pitch in reversed(_aim_hist):
+        if at <= t:
+            return az, pitch
+    return _aim["az"], _aim["pitch"]
+
+
+def _aim_see(f: dict) -> None:
+    """One face: x, y in [-1, 1] of the image, +x right, +y down."""
+    if not _aim["on"] or not f.get("detected") or f.get("x") is None or f.get("ts") == _aim["ts"]:
+        return
+    ex = -math.atan(float(f["x"]) / _FOCAL_N)
+    ey = math.atan(float(f.get("y") or 0.0) / (_FOCAL_N * _ASPECT))
+    with _lock:
+        _aim["ts"], _aim["seen"] = f.get("ts"), time.monotonic()
+        az, pitch = _aim_then(_aim["seen"] - _AIM_LAG)
+        if abs(ex) > _AIM_DEAD:
+            _aim["taz"] = _aim["body"] + _clip(az + _AIM_GAIN * ex - _aim["body"], _AIM_HEAD_MAX)
+        if abs(ey) > _AIM_DEAD:
+            _aim["tpitch"] = _clip(pitch + _AIM_GAIN * ey, _AIM_PITCH_MAX)
+
+
+def aim(md: str, h: float) -> tuple[float, float, float]:
+    """(head azimuth, head pitch, body) offsets for this tick, eased."""
+    now = time.monotonic()
+    with _lock:
+        dt = min(0.05, max(0.0, now - _aim["at"]))
+        _aim["at"] = now
+        if md != "free" or not _aim["on"] or now - _aim["seen"] > _AIM_LOST_S:
+            _aim["taz"] = _aim["tpitch"] = _aim["tbody"] = 0.0
+            _aim["off_since"] = 0.0
+        else:
+            rel = _aim["taz"] - _aim["body"]
+            if abs(rel) > _AIM_BODY_AT:
+                _aim["off_since"] = _aim["off_since"] or now
+                if now - _aim["off_since"] > _AIM_BODY_S:
+                    _aim["tbody"] = _aim["body"] + _clip(rel * 0.7, _AIM_BODY_STEP)
+                    _aim["off_since"] = now
+            else:
+                _aim["off_since"] = 0.0
+        _aim["tbody"] = _clip(h + _aim["tbody"], _YAW_LIMIT) - h
+        k = min(1.0, dt * _AIM_SMOOTH)
+        _aim["az"] += (_aim["taz"] - _aim["az"]) * k
+        _aim["pitch"] += (_aim["tpitch"] - _aim["pitch"]) * k
+        step = _YAW_RATE * dt
+        _aim["body"] += _clip(_aim["tbody"] - _aim["body"], step)
+        _aim_hist.append((now, _aim["az"], _aim["pitch"]))
+        return _aim["az"], _aim["pitch"], _aim["body"]
 
 
 def _start_head_tracking(self, weight: float = 1.0) -> None:
     _track["weight"] = weight
+    _aim["robot"] = self
     if not _track["suspended"]:
-        _orig_start_tracking(self, weight)
+        _aim["on"] = True
 
 
 def _stop_head_tracking(self) -> None:
     _track["weight"] = None
+    _aim["on"] = False
     _orig_stop_tracking(self)
 
 
 def _sync_tracking(robot, md: str) -> None:
+    body = settings().get("body_yaw")
+    if body != _track["body_yaw"]:
+        if _track["body_yaw"] is not None:
+            _track["weight"] = None
+            _aim["on"] = False
+        _track["body_yaw"] = body
     suspend = md != "free"
     if suspend == _track["suspended"]:
         return
     _track["suspended"] = suspend
-    try:
-        if suspend:
-            _orig_stop_tracking(robot)
-        elif _track["weight"] is not None:
-            _orig_start_tracking(robot, _track["weight"])
-    except Exception:  # noqa: BLE001 - never break the control loop
-        _track["suspended"] = not suspend
+    if suspend:
+        _track["weight"] = None
+        _aim["on"] = False
+    elif _track["weight"] is not None:
+        _aim["on"] = True
 
 
 def _wrap_command(orig):
@@ -246,18 +374,19 @@ def _wrap_command(orig):
     def wrapped(self, *args, **kwargs):
         h = held_yaw()
         md = mode()
-        p = held_pitch(md)
         _sync_tracking(self, md)
+        az, ap, ab = aim(md, h)
+        p = held_pitch(md) + ap
         with _hold_lock:
             target = _target(self, md, h)
             held = _step(target) if target is not None else None
-        if abs(h) <= 1e-4 and abs(p) <= 1e-4 and held is None:
+        if max(abs(h), abs(p), abs(az), abs(ab)) <= 1e-4 and held is None:
             return orig(self, *args, **kwargs)
         ba = sig.bind(self, *args, **kwargs)
         ba.apply_defaults()
         a = ba.arguments
-        if abs(p) > 1e-4 and a.get("head") is not None:
-            a["head"] = np.asarray(a["head"], dtype=np.float64) @ _ry(p)
+        if a.get("head") is not None and max(abs(p), abs(az - ab)) > 1e-4:
+            a["head"] = _rz(az - ab) @ np.asarray(a["head"], dtype=np.float64) @ _ry(p)
         if held is not None:
             b = min(1.0, max(0.0, float(held[8])))
             a["head"] = _blend_head(a.get("head"), held)
@@ -266,8 +395,8 @@ def _wrap_command(orig):
                 np.asarray(app_ant, dtype=np.float64)[:2] * (1 - b) + held[6:8] * b)
             a["antennas"] = [float(ant[0]), float(ant[1])]
         if a.get("head") is not None:
-            a["head"] = _rz(h) @ np.asarray(a["head"], dtype=np.float64)
-        a["body_yaw"] = float(a.get("body_yaw") or 0.0) + h
+            a["head"] = _rz(h + ab) @ np.asarray(a["head"], dtype=np.float64)
+        a["body_yaw"] = float(a.get("body_yaw") or 0.0) + h + ab
         return orig(*ba.args, **ba.kwargs)
 
     wrapped.__wrapped__ = orig
@@ -276,27 +405,25 @@ def _wrap_command(orig):
 
 _orig_head_pose = ReachyMini.get_current_head_pose
 _orig_joints = ReachyMini.get_current_joint_positions
-_orig_start_tracking = ReachyMini.start_head_tracking
 _orig_stop_tracking = ReachyMini.stop_head_tracking
 
 
 def _get_current_head_pose(self):
     pose = _orig_head_pose(self)
     h = held_yaw()
-    p = _pitch["cur"]
-    if abs(h) <= 1e-4 and abs(p) <= 1e-4:
+    p = _pitch["cur"] + _aim["pitch"]
+    yaw = h + _aim["az"]
+    if abs(yaw) <= 1e-4 and abs(p) <= 1e-4:
         return pose
-    pose = np.asarray(pose, dtype=np.float64)
-    if abs(h) > 1e-4:
-        pose = _rz(-h) @ pose
+    pose = _rz(-yaw) @ np.asarray(pose, dtype=np.float64)
     return pose @ _ry(-p) if abs(p) > 1e-4 else pose
 
 
 def _get_current_joint_positions(self):
     head, antennas = _orig_joints(self)
-    h = held_yaw()
-    if abs(h) > 1e-4 and head is not None and len(head):
-        head = [float(head[0]) - h, *head[1:]]
+    yaw = held_yaw() + _aim["body"]
+    if abs(yaw) > 1e-4 and head is not None and len(head):
+        head = [float(head[0]) - yaw, *head[1:]]
     return head, antennas
 
 
@@ -308,6 +435,7 @@ if not getattr(ReachyMini, "_peachy_patched", False):
     ReachyMini.start_head_tracking = _start_head_tracking
     ReachyMini.stop_head_tracking = _stop_head_tracking
     ReachyMini._peachy_patched = True
+    threading.Thread(target=_face_loop, name="peachy-faces", daemon=True).start()
 
     _orig_breath_init = BreathingMove.__init__
 

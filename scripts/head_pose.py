@@ -42,8 +42,30 @@ def _wake_cal(fdata: dict) -> tuple[dict, list] | None:
 
 
 def resolve_home(fdata: dict | None = None) -> tuple[dict, list] | None:
-    """Return absolute (head_pose, antennas) or None if nothing saved."""
+    """Return absolute (head_pose, antennas) or None if nothing saved.
+
+    Roll is 0 unless the user saved a home: the fallbacks are poses measured at
+    the end of the wake move, whose few degrees of roll nobody chose."""
     fdata = fdata or load_state()
+    resolved = _resolve_home(fdata)
+    if resolved and "head_home" not in fdata:
+        resolved[0]["roll"] = 0.0
+    return resolved
+
+
+def altaz(yaw: float, pitch: float, fdata: dict | None = None) -> dict:
+    """Head pose that only turns (yaw) and tilts (pitch), radians.
+
+    Head poses are extrinsic xyz, R = Rz(yaw)·Ry(pitch)·Rx(roll), so with roll
+    held at home's this is an alt-azimuth mount: the horizon stays level.
+    Position and roll come from home (zero if none)."""
+    resolved = resolve_home(fdata)
+    hp = dict(resolved[0]) if resolved else {k: 0.0 for k in _AXES}
+    hp["yaw"], hp["pitch"] = float(yaw), float(pitch)
+    return hp
+
+
+def _resolve_home(fdata: dict) -> tuple[dict, list] | None:
     if "head_home" in fdata:
         h = fdata["head_home"]
         hp = {k: float(h.get("head_pose", {}).get(k, 0.0)) for k in _AXES}

@@ -94,7 +94,59 @@ if not _TOKEN:
 _AUTH_ON = _TOKEN.lower() != "off"
 
 app = FastAPI(title="Peachy Control")
-_robot_lock = threading.Lock()       # one motion action at a time
+
+
+class _RobotLock:
+    """One motion action at a time. While it is held, the robot's own routine
+    (peachy-senses) holds off; the busy flag is sent from one thread, in order."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._want = threading.Condition()
+        self._on: bool | None = None
+        threading.Thread(target=self._sender, name="robot-busy", daemon=True).start()
+
+    def _notify(self, on: bool) -> None:
+        with self._want:
+            self._on = on
+            self._want.notify()
+
+    def _sender(self) -> None:
+        sent = None
+        while True:
+            with self._want:
+                if self._on == sent:
+                    self._want.wait(60 if sent else None)
+                on = self._on
+            if on is None or (on == sent and not on):
+                continue
+            if _senses_call("/busy", {"on": on, "ttl": 180}, timeout=2) is not None or not on:
+                sent = on
+            else:
+                time.sleep(2)
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        ok = self._lock.acquire(blocking, timeout)
+        if ok:
+            self._notify(True)
+        return ok
+
+    def release(self) -> None:
+        self._lock.release()
+        self._notify(False)
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> "_RobotLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.release()
+
+
+_robot_lock = _RobotLock()
 _last: dict = {"action": None, "ok": None, "msg": "", "at": 0.0}
 _LOG: deque = deque(maxlen=200)      # ring buffer for verbose analysis
 
@@ -156,7 +208,7 @@ def _run_script(args: list[str], timeout: float = 140.0) -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 
-# Read-only daemon queries that every console tab and sense-live poll. Shared so
+# Read-only daemon queries that every console tab polls. Shared so
 # the robot sees at most one request per path per second however many clients
 # are open; concurrent callers wait for the one request in flight. Failures are
 # cached too, so an offline robot doesn't queue up timeouts.
@@ -232,6 +284,23 @@ def _head_offset() -> dict[str, float]:
         return resolved[0]
     off = _load_state().get("head_offset", {})
     return {k: float(off.get(k, 0.0)) for k in _HEAD_AXES}
+
+
+def _stop_face_tracking() -> None:
+    """Daemon face tracking (1.11+, turned on by the conversation app) owns the
+    head at weight 1: body turns leave the head behind and tilts do nothing."""
+    try:
+        _daemon_json("/api/media/tracking/disable", "POST", {}, timeout=4)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+        pass
+
+
+def _altaz(yaw: float, pitch: float) -> dict:
+    """Head pose that only turns and tilts; roll and position are home's."""
+    sys.path.insert(0, str(_SCRIPTS))
+    from head_pose import altaz
+
+    return altaz(yaw, pitch)
 
 
 def _clamp_head(p: dict) -> dict:
@@ -332,25 +401,23 @@ def _fetch_snap_frame(out: Path) -> dict:
 
 def _release_robot_control() -> str:
     """Stop conversation / in-flight moves so wake-sleep owns the head."""
+    sys.path.insert(0, str(_SCRIPTS))
+    from motion_ready import ensure_motion_ready, stop_moves, wait_app_reset
+
     notes: list[str] = []
     if _conversation_running():
         _convo_sh("stop", 25)
         notes.append("conversation stopped")
         if _hold_mode() != "free":
             _motion({"mode": "free", "body_yaw": heading.enc_rad(0.0), "head_pitch": 0.0})
-        time.sleep(1.8)
-    try:
-        _daemon_json("/api/move/stop", "POST", {}, timeout=6.0)
+        wait_app_reset(HOST, PORT)
+    if stop_moves(HOST, PORT):
         notes.append("move halted")
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
-        pass
     try:
         _daemon_json("/api/motors/set_mode/enabled", "POST", {}, timeout=8.0)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
         pass
     time.sleep(0.25)
-    sys.path.insert(0, str(_SCRIPTS))
-    from motion_ready import ensure_motion_ready
 
     revived = ensure_motion_ready(HOST, PORT)
     if revived:
@@ -360,12 +427,12 @@ def _release_robot_control() -> str:
 
 def _stop_services(*, sleep: bool = False) -> tuple[bool, str]:
     """Stop conversation, other apps and in-flight moves."""
+    sys.path.insert(0, str(_SCRIPTS))
+    from motion_ready import stop_moves
+
     msgs: list[str] = []
-    try:
-        _daemon_json("/api/move/stop", "POST", {}, timeout=6.0)
+    if stop_moves(HOST, PORT):
         msgs.append("move halted")
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
-        pass
     if _conversation_running():
         _convo_sh("stop", 25)
         msgs.append("conversation stopped")
@@ -389,6 +456,11 @@ def _stop_services(*, sleep: bool = False) -> tuple[bool, str]:
 
 
 def _toggle_state() -> str:
+    """asleep | semi | awake: the robot's (it changes state on its own), else the
+    last one this laptop saw."""
+    st = _senses_status()
+    if st and st.get("state") in ("asleep", "semi", "awake"):
+        return st["state"]
     try:
         return json.loads(_STATE_FILE.read_text()).get("state", "unknown")
     except (FileNotFoundError, json.JSONDecodeError):
@@ -583,6 +655,7 @@ def status() -> JSONResponse:
         "busy": _robot_lock.locked(),
         "app": _current_app() if up else None,
         "sense": _sense_summary(),
+        "airpods": _airpods_summary(),
         "last": _last,
         "host": f"{HOST}:{PORT}",
     })
@@ -814,15 +887,6 @@ def _ensure_wav_on_robot(filename: str) -> None:
     upload_wav(HOST, PORT, local)
 
 
-_speaker_until = 0.0
-
-
-def _speaking(seconds: float) -> None:
-    """Mark the robot speaker busy so the wake word does not hear Peachy itself."""
-    global _speaker_until
-    _speaker_until = max(_speaker_until, time.time() + seconds)
-
-
 def _wav_seconds(path: Path, default: float = 4.0) -> float:
     try:
         import wave
@@ -834,7 +898,6 @@ def _wav_seconds(path: Path, default: float = 4.0) -> float:
 
 def _play_wav_file(filename: str) -> None:
     _ensure_wav_on_robot(filename)
-    _speaking(_wav_seconds(_TURRET_DIR / filename) + 1.0)
     _daemon_json("/api/media/play_sound", "POST", {"file": filename}, timeout=12)
 
 
@@ -966,7 +1029,6 @@ async def volume_set(request: Request) -> JSONResponse:
     except Exception:
         body = {}
     vol = max(0, min(100, int(body.get("volume", _DEFAULT_VOLUME))))
-    _speaking(2.5)
     try:
         snap = _apply_speaker_volume(vol)
         _logrec("volume:set", True, f"{vol}%")
@@ -980,7 +1042,6 @@ async def volume_set(request: Request) -> JSONResponse:
 @app.post("/api/volume/test")
 def volume_test() -> JSONResponse:
     """Play test sound at current volume without changing level."""
-    _speaking(3.0)
     try:
         snap = _daemon_json("/api/volume/test-sound", "POST", {}, timeout=12.0)
         _logrec("volume:test", True, snap.get("message", "ok"))
@@ -994,16 +1055,11 @@ def volume_test() -> JSONResponse:
 @app.post("/api/say")
 def say_text(body: dict) -> JSONResponse:
     """Speak typed text on the robot speaker (ctl-say.py)."""
-    global _speaker_until
     text = " ".join(str(body.get("text", "")).split())[:500]
     if not text:
         return JSONResponse({"ok": False, "msg": "Type something first"})
     t0 = time.time()
-    _speaking(130)
-    try:
-        ok, msg = _run_script([str(_SCRIPTS / "ctl-say.py"), text], timeout=120)
-    finally:
-        _speaker_until = time.time() + 1.5
+    ok, msg = _run_script([str(_SCRIPTS / "ctl-say.py"), text], timeout=120)
     _logrec("say", ok, f"({time.time()-t0:.1f}s) {msg.splitlines()[-1] if msg else ''}")
     return JSONResponse({"ok": ok, "msg": msg})
 
@@ -1226,11 +1282,14 @@ def snap() -> JSONResponse:
 
 @app.post("/api/abort")
 def abort_action() -> JSONResponse:
-    """Emergency halt — stop moves, background apps, Follow and room watch; robot stays put."""
-    cfg = _sense_cfg()
-    if cfg["follow"] or cfg["watch"]:
-        _sense_set(follow=False, watch=False)
+    """Emergency halt — stop moves, background apps, Follow, room watch and the wake word;
+    robot stays put."""
+    airpods = _airpods_stop()
+    if any(_sense_cfg().values()):
+        _sense_set(follow=False, watch=False, wake=False)
     ok, m = _stop_services(sleep=False)
+    if airpods:
+        m = f"avatar ended · {m}"
     _logrec("ABORT", ok, m)
     _last.update(action="abort", ok=ok, msg=m, at=time.time())
     return JSONResponse({"ok": ok, "msg": m})
@@ -1238,13 +1297,14 @@ def abort_action() -> JSONResponse:
 
 @app.post("/api/shutdown")
 def shutdown_action() -> JSONResponse:
-    """Stop everything Peachy-ish (conversation, watch) and sleep."""
+    """Stop everything Peachy-ish (conversation, senses) and sleep."""
+    _airpods_stop()
     if not _robot_lock.acquire(blocking=False):
         raise HTTPException(409, "Peachy is busy — wait a sec")
     try:
         t0 = time.time()
         if any(_sense_cfg().values()):
-            _sense_set(follow=False, wake=False, watch=False)
+            _sense_set(follow=False, watch=False, wake=False)
         ok, m = _stop_services(sleep=True)
         _logrec("shutdown", ok, f"({time.time()-t0:.1f}s) {m}")
         _last.update(action="shutdown", ok=ok, msg=m, at=time.time())
@@ -1445,6 +1505,7 @@ def _set_toggle_state(state: str) -> None:
     d["state"] = state
     d["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     _STATE_FILE.write_text(json.dumps(d, indent=2) + "\n")
+    _senses_call("/state", {"state": state})
 
 
 def _enter_semi() -> tuple[bool, str]:
@@ -1634,6 +1695,8 @@ def body_yaw_move(body: dict) -> JSONResponse:
         try:
             running = _conversation_running()
             patched = _patch_installed()
+            if running:
+                _stop_face_tracking()
             if running and patched and _motion({"body_yaw": yaw_rad}) is not None:
                 present = _wait_body(yaw_rad, 3.5 + abs(enc_deg) / 90.0)
                 msg = (f"body yaw → {yaw_deg:+.1f}° (at {heading.to_world(-math.degrees(present)):+.1f}°)"
@@ -1658,7 +1721,7 @@ def body_yaw_move(body: dict) -> JSONResponse:
             _enable_motors()
             state = _daemon_json("/api/state/full", timeout=4)
             hp = state.get("head_pose") or {}
-            head = {k: float(hp.get(k, 0.0) or 0.0) for k in ("x", "y", "z", "roll", "pitch", "yaw")}
+            head = _altaz(float(hp.get("yaw", 0.0) or 0.0), float(hp.get("pitch", 0.0) or 0.0))
             rel = 0.0
 
             def goto(body_cmd: float, head_yaw: float, step: float) -> float:
@@ -1709,14 +1772,14 @@ def head_pitch(body: dict) -> JSONResponse:
         pitch = -math.radians(up)
         try:
             if _conversation_running() and _patch_installed():
+                _stop_face_tracking()
                 if _motion({"head_pitch": pitch}) is None:
                     raise OSError("robot SSH unavailable")
                 msg = f"head tilt → {up:+.0f}° · conversation kept running"
             else:
                 _enable_motors()
                 hp = _daemon_json("/api/state/full", timeout=4).get("head_pose") or {}
-                pose = {k: float(hp.get(k, 0.0) or 0.0) for k in _HEAD_AXES}
-                pose["pitch"] = pitch
+                pose = _altaz(float(hp.get("yaw", 0.0) or 0.0), pitch)
                 dur = max(0.4, min(1.5, abs(pitch - float(hp.get("pitch", 0.0) or 0.0)) / math.radians(40)))
                 _daemon_json("/api/move/goto", "POST", {"head_pose": _clamp_head(pose), "duration": dur,
                                                         "interpolation": "minjerk"}, timeout=12)
@@ -2015,13 +2078,15 @@ def apps_stop() -> JSONResponse:
 
 
 # -------------------------------------------------------------------- senses
+# State, room watch, Follow and the wake word run on the robot (robot/peachy_senses.py,
+# systemd unit peachy-senses, scripts/sense-robot.sh) and keep going with the laptop off.
+# The console pushes its settings, reports its own state changes, holds the robot
+# off while it acts (see _RobotLock), and copies the robot's events into the log.
 _SENSE_CFG = _RUN / "sense_config.json"
-_SENSE_PID = _RUN / "sense_live.pid"
-_SENSE_LOG = _RUN / "sense_live.log"
-_SENSE_STATE = _RUN / "sense_state.json"
-_SENSE_FEATURES = ("follow", "wake", "watch")
-_sense_lock = threading.Lock()
-_sense_started = {"at": 0.0}
+_SENSE_FEATURES = ("follow", "watch", "wake")
+_SENSES_PORT = 8767
+_SENSES_TOKEN = _RUN / "senses_token"
+_senses: dict = {"status": None, "at": 0.0, "down_until": 0.0, "seen": None, "sent": None, "sent_at": 0.0}
 
 
 def _sense_cfg() -> dict:
@@ -2032,126 +2097,112 @@ def _sense_cfg() -> dict:
     return {k: bool(d.get(k)) for k in _SENSE_FEATURES}
 
 
-def _sense_pid() -> int | None:
-    try:
-        pid = int(_SENSE_PID.read_text().strip())
-        os.kill(pid, 0)
-    except (OSError, ValueError):
+def _senses_call(path: str, body: dict | None = None, timeout: float = 2.0) -> dict | None:
+    """GET (body None) or POST to the robot's senses service; None if it is out."""
+    if body is None and time.time() < _senses["down_until"]:
         return None
-    try:
-        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                             capture_output=True, text=True, timeout=3).stdout
-    except (subprocess.TimeoutExpired, OSError):
-        cmd = ""
-    return pid if "sense-live.py" in cmd else None
-
-
-def _sense_stop() -> None:
-    pid = _sense_pid()
-    if pid is not None:
+    req = urllib.request.Request(f"http://{HOST}:{_SENSES_PORT}{path}",
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 method="GET" if body is None else "POST")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            req.add_header("X-Peachy-Senses", _SENSES_TOKEN.read_text().strip())
         except OSError:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-        for _ in range(30):
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                break
-            time.sleep(0.1)
-    _SENSE_PID.unlink(missing_ok=True)
-    _SENSE_STATE.unlink(missing_ok=True)
+            return None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = json.loads(r.read().decode() or "{}")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+        if body is None:
+            _senses["down_until"] = time.time() + 5
+        return None
+    if isinstance(out, dict) and "state" in out:
+        _senses.update(status=out, at=time.time())
+    return out
 
 
-def _sense_apply(cfg: dict) -> bool:
-    with _sense_lock:
-        _sense_stop()
-        flags = [f"--{k}" for k in _SENSE_FEATURES if cfg.get(k)]
-        if not flags:
-            return True
-        try:
-            if json.loads(_SENSE_CFG.read_text()).get("dry"):
-                flags.append("--dry-run")
-        except (OSError, json.JSONDecodeError):
-            pass
-        logf = open(_SENSE_LOG, "w", buffering=1)
-        env = {**os.environ, "PYTHONUNBUFFERED": "1", "REACHY_HOST": HOST,
-               "PEACHY_DASH_URL": f"http://127.0.0.1:{_dashboard_port()}",
-               "PEACHY_TOKEN": _TOKEN}
-        proc = subprocess.Popen([sys.executable, "-u", str(_SCRIPTS / "sense-live.py"), *flags],
-                                cwd=_REPO, stdout=logf, stderr=subprocess.STDOUT,
-                                start_new_session=True, env=env)
-        _SENSE_PID.write_text(str(proc.pid))
-        _sense_started["at"] = time.time()
-        time.sleep(0.5)
-        return proc.poll() is None
+def _senses_status(max_age: float = 1.0) -> dict | None:
+    if time.time() - _senses["at"] <= max_age and _senses["status"] is not None:
+        return _senses["status"]
+    return _senses_call("/status")
+
+
+def _senses_push(cfg: dict | None = None) -> bool:
+    sys.path.insert(0, str(_SCRIPTS))
+    from senses_cfg import build
+
+    c = cfg or _sense_cfg()
+    data = {**build(**c), "volume": _DEFAULT_VOLUME, "voice": _DEFAULT_CONVO_VOICE}
+    if _senses_call("/config", data, timeout=4) is None:
+        return False
+    _senses.update(sent=data, sent_at=time.time())
+    return True
+
+
+def _senses_watch() -> None:
+    """Background: robot events into the activity log; re-push settings when the
+    calibration they come from changes (or the robot restarted without them)."""
+    sys.path.insert(0, str(_SCRIPTS))
+    from senses_cfg import build
+
+    while True:
+        st = _senses_call("/status", timeout=3)
+        if st:
+            evs = st.get("events") or []
+            last = evs[-1]["id"] if evs else 0
+            if _senses["seen"] is None or last < _senses["seen"]:
+                _senses["seen"] = 0 if _senses["seen"] is not None else last
+            for e in evs:
+                if e["id"] > _senses["seen"]:
+                    _logrec("robot", bool(e.get("ok", True)), str(e.get("msg", ""))[:300])
+            _senses["seen"] = max(_senses["seen"], last)
+            c = _sense_cfg()
+            try:
+                want = {**build(**c), "volume": _DEFAULT_VOLUME, "voice": _DEFAULT_CONVO_VOICE}
+            except Exception:  # noqa: BLE001
+                want = None
+            robot_cfg = st.get("cfg") or {}
+            if want is not None and (want != _senses["sent"]
+                                     or any(robot_cfg.get(k) != c[k] for k in _SENSE_FEATURES)):
+                if time.time() - _senses["sent_at"] > 10:
+                    _senses_push(c)
+        time.sleep(3)
+
+
+threading.Thread(target=_senses_watch, name="senses-watch", daemon=True).start()
 
 
 def _sense_set(**changes: bool) -> dict:
-    cfg = {**_sense_cfg(), **changes}
+    cfg = {**_sense_cfg(), **{k: v for k, v in changes.items() if k in _SENSE_FEATURES}}
     try:
         extra = {k: v for k, v in json.loads(_SENSE_CFG.read_text()).items() if k not in _SENSE_FEATURES}
     except (OSError, json.JSONDecodeError):
         extra = {}
     _SENSE_CFG.write_text(json.dumps({**extra, **cfg}))
-    _sense_apply(cfg)
+    _senses_push(cfg)
     return cfg
 
 
 def _sense_summary() -> dict:
     cfg = _sense_cfg()
-    pid = _sense_pid()
-    if any(cfg.values()) and pid is None and time.time() - _sense_started["at"] > 30:
-        threading.Thread(target=_sense_apply, args=(cfg,), daemon=True).start()
+    st = _senses_status()
     live: dict = {}
-    if pid is not None:
-        try:
-            live = json.loads(_SENSE_STATE.read_text())
-            if time.time() - float(live.get("ts", 0)) > 10:
-                live = {"stale": True}
-        except (OSError, json.JSONDecodeError, ValueError):
-            live = {}
-    return {**cfg, "running": pid is not None, "live": live}
+    if st:
+        live = {"follow": st.get("follow") if cfg["follow"] else None,
+                "watch": st.get("watch") if cfg["watch"] else None,
+                "wake": st.get("wake") if cfg["wake"] else None,
+                "camera": st.get("camera"), "acting": st.get("acting"), "cpu": st.get("cpu")}
+    return {**cfg, "running": st is not None, "live": live}
 
 
 @app.get("/api/sense")
 def sense_status() -> JSONResponse:
     s = _sense_summary()
-    try:
-        tail = [ln for ln in _SENSE_LOG.read_text(errors="replace").splitlines()
-                if ln.startswith("[") and not ln.startswith("[ WARN")][-8:]
-    except OSError:
-        tail = []
+    st = _senses["status"] or {}
+    tail = [f"[{time.strftime('%H:%M:%S', time.localtime(e['t']))}] {e['msg']}"
+            for e in (st.get("events") or [])[-8:]]
     return JSONResponse({"ok": True, **s, "log": tail})
-
-
-@app.get("/api/sense/gate")
-def sense_gate() -> JSONResponse:
-    """Who owns the robot. A semi-awake conversation app (head tucked, mic muted)
-    owns nothing, so the wake word keeps listening; Follow stays off (not awake)."""
-    app_owner = ""
-    up = _daemon_up()
-    cur = _current_app() if up else None
-    if cur and cur.get("state") in ("starting", "running", "stopping"):
-        app_owner = "conversation" if cur.get("name") == _CONVO_APP_NAME else "app"
-    semi = app_owner == "conversation" and _hold_mode(block=False) != "free"
-    if semi:
-        app_owner = ""
-    if not up:
-        app_owner = "offline"
-    elif not app_owner:
-        try:
-            if _daemon_get("/api/move/running", timeout=3):
-                app_owner = "move"
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
-            pass
-    owner = "busy" if _robot_lock.locked() else app_owner
-    state = _toggle_state()
-    return JSONResponse({"awake": state == "awake", "state": state, "owner": owner, "semi": semi,
-                         "speaking": time.time() < _speaker_until})
 
 
 @app.post("/api/sense/{feature}/{onoff}")
@@ -2159,20 +2210,132 @@ def sense_toggle(feature: str, onoff: str) -> JSONResponse:
     if feature not in _SENSE_FEATURES or onoff not in ("on", "off"):
         raise HTTPException(404, "unknown sense")
     cfg = _sense_set(**{feature: onoff == "on"})
-    running = _sense_pid() is not None
-    ok = running or not any(cfg.values())
-    msg = f"{feature} {onoff}" if ok else "sense-live failed to start — see .run/sense_live.log"
+    ok = _senses["sent"] is not None and _senses["sent"].get(feature) == (onoff == "on") \
+        and time.time() - _senses["sent_at"] < 10
+    msg = f"{feature} {onoff}" if ok else "robot senses unreachable — run scripts/sense-robot.sh install"
     _logrec(f"sense:{feature}:{onoff}", ok, msg)
-    return JSONResponse({"ok": ok, "msg": msg, **cfg, "running": running})
+    return JSONResponse({"ok": ok, "msg": msg, **cfg, "running": ok})
 
 
-@app.post("/api/sense/note")
-def sense_note(body: dict) -> JSONResponse:
-    """Room watch events land in the activity log."""
-    msg = str(body.get("msg") or "").strip()[:300]
-    if msg:
-        _logrec("watch", body.get("ok", True) is not False, msg)
-    return JSONResponse({"ok": True})
+# ---------------------------------------------------------------- Avatar
+# scripts/ctl-avatar.py makes Peachy your avatar: its head follows the AirPods
+# on this Mac, this Mac's mic plays on its speaker and its mic in the AirPods.
+# The script swaps whatever app runs for the robot app peachy_avatar (so the
+# daemon doesn't put Peachy to sleep), and the session holds _robot_lock
+# throughout. Ending it stops that app and the daemon puts Peachy to sleep.
+_AIRPODS_STATUS = _RUN / "airpods_status.json"
+_AIRPODS_LOG = _RUN / "airpods.log"
+_airpods: dict = {"proc": None, "err": ""}
+_airpods_mx = threading.Lock()
+
+
+def _airpods_on() -> bool:
+    p = _airpods["proc"]
+    return p is not None and p.poll() is None
+
+
+def _airpods_summary() -> dict:
+    live = None
+    if _airpods_on():
+        try:
+            live = json.loads(_AIRPODS_STATUS.read_text())
+        except (OSError, ValueError):
+            live = {"status": "starting"}
+    return {"on": _airpods_on(), "live": live, "err": _airpods["err"]}
+
+
+def _airpods_tail() -> str:
+    try:
+        text = _AIRPODS_LOG.read_text(errors="replace").replace("\r", "\n")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def _airpods_watch(p: subprocess.Popen) -> None:
+    code = p.wait()
+    _robot_lock.release()
+    ok = code == 0
+    _airpods["err"] = "" if ok else _airpods_tail()
+    try:
+        after = json.loads(_AIRPODS_STATUS.read_text()).get("after") or "asleep"
+    except (OSError, ValueError):
+        after = "asleep"
+    _logrec("avatar:off", ok, f"avatar ended · Peachy {after}" if ok else _airpods["err"])
+    cur = _current_app()
+    if not (cur and cur.get("state") in ("starting", "running")):
+        _set_toggle_state(after)
+
+
+def _airpods_stop(wait: float = 20.0) -> bool:
+    """End the session: the script glides home, then stops the robot app."""
+    p = _airpods["proc"]
+    if p is None or p.poll() is not None:
+        return False
+    p.send_signal(signal.SIGTERM)
+    try:
+        p.wait(timeout=wait)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    time.sleep(0.2)
+    return True
+
+
+def _airpods_reap() -> None:
+    """A session left over from a console that went away still owns the head."""
+    try:
+        pid = int(json.loads(_AIRPODS_STATUS.read_text()).get("pid"))
+        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=3).stdout
+        if "ctl-avatar.py" in cmd or "ctl-airpods.py" in cmd:
+            os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        pass
+
+
+_airpods_reap()
+
+
+@app.get("/api/airpods")
+def airpods_status() -> JSONResponse:
+    return JSONResponse({"ok": True, **_airpods_summary()})
+
+
+@app.post("/api/airpods/{cmd}")
+def airpods_cmd(cmd: str) -> JSONResponse:
+    if cmd in ("recenter", "level"):
+        if not _airpods_on():
+            return JSONResponse({"ok": False, "msg": "the avatar is off"})
+        _airpods["proc"].send_signal(signal.SIGUSR1 if cmd == "recenter" else signal.SIGUSR2)
+        return JSONResponse({"ok": True, "msg": "recentered" if cmd == "recenter" else "leveling in 3 s"})
+    if cmd == "off":
+        ended = _airpods_stop()
+        return JSONResponse({"ok": True, "msg": "avatar ended" if ended else "already off"})
+    if cmd != "on":
+        raise HTTPException(404, "unknown command")
+    with _airpods_mx:
+        if _airpods_on():
+            return JSONResponse({"ok": True, "msg": "the avatar is already on"})
+        if not _daemon_up():
+            return JSONResponse({"ok": False, "msg": "Peachy is offline"})
+        if not _robot_lock.acquire(blocking=False):
+            raise HTTPException(409, "Peachy is busy — wait a sec")
+        try:
+            _AIRPODS_STATUS.unlink(missing_ok=True)
+            with open(_AIRPODS_LOG, "w") as log:
+                p = subprocess.Popen(
+                    [sys.executable, str(_SCRIPTS / "ctl-avatar.py"), "--status-file", str(_AIRPODS_STATUS)],
+                    cwd=_REPO, env=_script_env(), stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=subprocess.STDOUT)
+        except Exception:
+            _robot_lock.release()
+            raise
+        _airpods.update(proc=p, err="")
+        threading.Thread(target=_airpods_watch, args=(p,), name="avatar", daemon=True).start()
+    msg = "Peachy is your avatar"
+    _logrec("avatar:on", True, msg)
+    return JSONResponse({"ok": True, "msg": msg})
 
 
 # ---------------------------------------------------------------- heading
@@ -2224,8 +2387,7 @@ def heading_run(what: str) -> JSONResponse:
 
 
 # ---------------------------------------------------------------- mic scope
-# Its own audio-only WebRTC consumer, open only while the console is polling:
-# sense-live closes its stream during conversations, which is when the mic matters.
+# Its own audio-only WebRTC consumer, open only while the console is polling.
 _MIC_BLOCK = 320                     # 20 ms at 16 kHz
 
 

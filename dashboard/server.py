@@ -1637,6 +1637,30 @@ def idle_motion_set(body: dict) -> JSONResponse:
     return JSONResponse({"ok": True, "msg": msg, **upd})
 
 
+@app.get("/api/converse/facts")
+def facts_get() -> JSONResponse:
+    m = _motion()
+    if m is None:
+        return JSONResponse({"ok": False, "msg": "robot SSH unavailable"})
+    facts = (m.get("settings") or {}).get("facts") or []
+    return JSONResponse({"ok": True, "installed": m.get("installed", False),
+                         "facts": [str(f) for f in facts] if isinstance(facts, list) else []})
+
+
+@app.post("/api/converse/facts")
+def facts_set(body: dict) -> JSONResponse:
+    raw = body.get("facts") or []
+    lines = raw.splitlines() if isinstance(raw, str) else [str(f) for f in raw]
+    facts = [f.strip()[:280] for f in lines if f.strip()][:20]
+    m = _motion({"facts": facts})
+    if m is None:
+        return JSONResponse({"ok": False, "msg": "robot SSH unavailable"})
+    if not m.get("installed"):
+        return JSONResponse({"ok": False, "msg": "saved, but the app patch is not installed — run scripts/app-patch.sh apply"})
+    _logrec("converse:facts", True, f"{len(facts)} fixed facts")
+    return JSONResponse({"ok": True, "msg": f"{len(facts)} fixed facts", "facts": facts})
+
+
 _BODY_YAW_LIM = math.radians(160.0)
 
 

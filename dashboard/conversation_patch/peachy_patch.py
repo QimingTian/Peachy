@@ -9,7 +9,8 @@ Reads ~/.peachy/motion.json on the robot (re-read live, no restart needed):
   head_pitch    extra head pitch, radians (positive looks down), added in the
                 head's own frame on top of whatever the app does, while "free".
                 Glides at _PITCH_RATE; back to 0 while tucked/lifted.
-  breath_scale  size of the idle breathing (head bob + antenna sway), 1.0 = stock.
+  breath_scale  size of the idle breathing head bob, 1.0 = stock. The stock
+                antenna sway is always off.
   idle_every_s  seconds of silence before an idle action (dance / emotion / look);
                 stock 180, 0 = never.
   mode          "free" (stock: the app drives head and antennas), "tucked" or
@@ -20,6 +21,12 @@ Reads ~/.peachy/motion.json on the robot (re-read live, no restart needed):
   mic_ns        XVF3800 stationary noise floor PP_MIN_NS written at app start,
                 default 0.15 (stock 0.8).
   agc_max       XVF3800 PP_AGCMAXGAIN written at app start, default 10 (stock).
+  facts         list of fixed facts (where Peachy lives, ...) put before the
+                session instructions; the app's forget tool can't remove them.
+                A change reaches the live session within 2 s.
+
+The instructions also get _TOOL_NOTE, so Peachy says a word before a lookup
+instead of going quiet until the tool returns.
 
 Loaded by one import line in reachy_mini_conversation_app/main.py.
 """
@@ -29,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import math
 import threading
 import time
@@ -40,12 +48,15 @@ import numpy as np
 from reachy_mini import ReachyMini
 from scipy.spatial.transform import Rotation
 
+import reachy_mini_conversation_app.huggingface_realtime as _hr
+import reachy_mini_conversation_app.prompts as _prompts
 from reachy_mini_conversation_app.console import LocalStream
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 from reachy_mini_conversation_app.moves import BreathingMove, MovementManager
 
 _FILE = Path.home() / ".peachy" / "motion.json"
+_log = logging.getLogger(__name__)
 _YAW_LIMIT = math.radians(160)
 _YAW_RATE = math.radians(90)
 _PITCH_LIMIT = math.radians(30)
@@ -85,6 +96,39 @@ def _number(key: str, default: float) -> float:
         return float(settings().get(key, default))
     except (TypeError, ValueError):
         return default
+
+
+_TOOL_NOTE = (
+    "When you call a tool that takes a moment (web search, weather, time, the camera, "
+    "anything that looks something up), first say one short natural line in the same "
+    "reply, like \"Let me check.\" or \"One sec, I'll look that up.\", then call the tool "
+    "right away. Never end your turn with only that line."
+)
+
+
+def _facts() -> list[str]:
+    f = settings().get("facts")
+    if not isinstance(f, list):
+        return []
+    return [s for s in (str(x).strip()[:280] for x in f) if s][:20]
+
+
+async def _watch_facts(handler) -> None:
+    """Push changed facts into the live session (the app only reads instructions
+    when a session starts or the personality changes)."""
+    seen = _facts()
+    while True:
+        await asyncio.sleep(2.0)
+        now = _facts()
+        if now == seen or handler.connection is None:
+            continue
+        seen = now
+        try:
+            await handler.connection.session.update(session=_hr.RealtimeSessionCreateRequestParam(
+                type="realtime", instructions=_hr.get_session_instructions(handler.instance_path)))
+            _log.info("peachy: fixed facts updated (%d)", len(now))
+        except Exception as e:  # noqa: BLE001
+            _log.warning("peachy: couldn't update the session's facts: %s", e)
 
 
 def held_yaw() -> float:
@@ -529,7 +573,7 @@ if not getattr(ReachyMini, "_peachy_patched", False):
         _orig_breath_init(self, *args, **kwargs)
         k = max(0.0, min(2.0, _number("breath_scale", 1.0)))
         self.breathing_z_amplitude *= k
-        self.antenna_sway_amplitude *= k
+        self.antenna_sway_amplitude = 0.0   # the antenna motors' whine gets into the mic
 
     BreathingMove.__init__ = _breath_init
 
@@ -585,7 +629,11 @@ if not getattr(ReachyMini, "_peachy_patched", False):
 
     async def _session(self) -> None:
         self._peachy_loop = asyncio.get_running_loop()
-        await _orig_session(self)
+        watch = asyncio.ensure_future(_watch_facts(self))
+        try:
+            await _orig_session(self)
+        finally:
+            watch.cancel()
 
     async def _say(self, text: str) -> None:
         loop = getattr(self, "_peachy_loop", None)
@@ -595,6 +643,17 @@ if not getattr(ReachyMini, "_peachy_patched", False):
 
     HuggingFaceRealtimeHandler._run_realtime_session = _session
     HuggingFaceRealtimeHandler.say = _say
+
+    _orig_instructions = _prompts.get_session_instructions
+
+    def _instructions(instance_path=None) -> str:
+        facts = _facts()
+        head = ("Fixed facts (always true; don't ask the user about them):\n"
+                + "\n".join(f"- {f}" for f in facts)) if facts else ""
+        return "\n\n".join(p for p in (head, _orig_instructions(instance_path), _TOOL_NOTE) if p)
+
+    _prompts.get_session_instructions = _instructions
+    _hr.get_session_instructions = _instructions
 
     # The room's air conditioning hums at 117/180 Hz; stock PP_MIN_NS 0.8 barely
     # suppresses it. 0.15 (XMOS default) lowered the voice-band floor ~13 dB with

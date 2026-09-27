@@ -369,6 +369,10 @@ canvas.scope{height:72px}
 .field > span:first-child{color:var(--dim)}
 .field output{text-align:right;font:12px var(--mono)}
 .field.wide{grid-template-columns:120px 1fr}
+.field.facts{align-items:start}
+.field textarea{width:100%;resize:vertical;min-height:64px;padding:8px 14px;border-radius:14px;font:12px/1.5 var(--mono);
+  background:var(--glass-fill);border:1px solid var(--glass-border);box-shadow:var(--lg-bezel)}
+.field textarea:focus{outline:none;border-color:var(--glass-border-bright)}
 .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
 .kv{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:16px;overflow:hidden;margin-bottom:14px}
 .kv div{background:var(--bg);padding:10px 12px}
@@ -645,6 +649,9 @@ dialog .actions{justify-content:flex-end;margin-top:20px}
       <div class="field"><span>Breathing</span><input type="range" id="idleScale" min="0" max="150" step="5" value="100" data-need="robot"><output id="idleScaleO">100%</output></div>
       <div class="field"><span>Calmness</span><input type="range" id="idleCalm" min="0" max="100" step="5" value="28" data-need="robot"><output id="idleCalmO">—</output></div>
       <p class="result" id="idleResult"></p>
+      <label class="field wide facts"><span>Always knows</span><textarea id="factsTxt" rows="3" spellcheck="false" data-need="robot" placeholder="One fact per line, e.g. We are in Pomfret Center, Connecticut."></textarea></label>
+      <div class="row"><span class="dim" style="flex:1">Where it is, who's who — it won't ask again</span><button class="btn" id="factsSave" data-need="robot">Save</button></div>
+      <p class="result" id="factsResult"></p>
       <p style="margin:12px 0 0"><a id="gradioLink" href="#" target="_blank" rel="noopener">Conversation app ↗</a></p>
     </section>
 
@@ -1466,6 +1473,16 @@ async function loadIdleMotion(){
   idleLabels();
   sysResult("#idleResult",d.installed?null:false,d.installed?"":"App patch not installed");
 }
+async function loadFacts(){
+  const d=await api("/api/converse/facts",{timeout:20000});
+  if(d.ok===false){sysResult("#factsResult",false,d.msg||"Unavailable");return;}
+  $("#factsTxt").value=(d.facts||[]).join("\n");
+}
+$("#factsSave").addEventListener("click",async()=>{
+  const d=await post("/api/converse/facts",{body:{facts:$("#factsTxt").value},timeout:20000});
+  if(d.ok!==false) $("#factsTxt").value=(d.facts||[]).join("\n");
+  sysResult("#factsResult",d.ok!==false,d.ok===false?(d.msg||"Couldn’t save"):`Saved · ${d.msg} · a running conversation picks them up in 2 s`);
+});
 let idleT=null;
 ["idleScale","idleCalm"].forEach(id=>$("#"+id).addEventListener("input",()=>{
   idleLabels(); clearTimeout(idleT);
@@ -1759,7 +1776,7 @@ function openSheet(section){
   if(S.store) closeStore();
   S.sheet=true;
   $("#sheet").classList.add("on"); $("#scrim").classList.add("on");
-  loadHeadOffsets(); pollFan(); loadIdleMotion(); loadHeading();
+  loadHeadOffsets(); pollFan(); loadIdleMotion(); loadFacts(); loadHeading();
   if(section) setTimeout(()=>$("#"+section)?.scrollIntoView({behavior:"smooth",block:"start"}),60);
   $("#btnSheetClose").focus();
 }

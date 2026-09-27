@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stop Peachy automation — one command when too many things are running.
 #
-#   ./scripts/tool-stop-all.sh           # halt moves, conversation, senses (room watch, Follow, wake word)
+#   ./scripts/tool-stop-all.sh           # halt moves, conversation, senses (room watch, wake word)
 #   ./scripts/tool-stop-all.sh --sleep   # same + gentle sleep
 #
 # Does not stop the dashboard or the robot daemon.
@@ -32,7 +32,8 @@ if [ -f "${RUN}/sense_config.json" ]; then
 import json, sys
 p = sys.argv[1]
 cfg = json.load(open(p))
-cfg.update(follow=False, watch=False, wake=False)
+cfg.pop("follow", None)
+cfg.update(watch=False, wake=False)
 json.dump(cfg, open(p, "w"))
 EOF
 fi

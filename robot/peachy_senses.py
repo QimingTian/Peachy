@@ -6,23 +6,21 @@ installed by scripts/sense-robot.sh). Everything here works with the laptop off.
   reports its own actions (POST /state); the routine below updates it too.
 - Room watch (setting "watch"). By day ("day", 07:00-23:00) an asleep Peachy
   dozes: conversation app warm, head tucked, mic muted, body at the doze direction.
-  When the lights come on (mean luma of the tucked camera view crosses the
-  cal-light thresholds and jumps within 8 s) it lifts the head and sweeps the body;
+  When the lights come on (mean luma of the tucked camera view steps up within
+  2 s, see Watch._step) it lifts the head and sweeps the body;
   a face wakes it with a greeting, nobody means back to Dozing. A conversation
   nobody has spoken to for doze_after_s dozes again by day and sleeps by night.
   At night Dozing or an idle Awake goes to sleep.
-- Follow (setting "follow"): awake with no app running, it follows the nearest
-  face alt-azimuth (yaw and pitch; roll and position held at "level"), the body
-  takes over past 18°. It doesn't turn toward voices: the mic array flags the
-  robot's own motor noise as speech, from straight left or right, so every turn
-  set off the next one.
+- Follow (setting "follow", which the console always sends off: following the
+  speaker belongs to the conversation app patch now): awake with no app running,
+  it follows the nearest face alt-azimuth, the body taking over past 18°.
 - Wake word (setting "wake"): "Hey Peachy" while nothing else has the robot
-  (asleep, Dozing, or awake with no app) wakes it into a conversation, turned
-  toward the voice. openWakeWord models (wake.py) on the shared ALSA mic, only
+  (asleep, Dozing, or awake with no app) wakes it into a conversation after the
+  same look-around as room watch. Vosk (wake.py) on the shared ALSA mic, only
   in those states and only while the room isn't quiet.
 
 Faces: YuNet (reachy_mini.vision) on the daemon's camera over IPC, 320 px wide,
-10 times a second at normal priority, only while following or looking around.
+10 times a second at normal priority, only while looking around.
 Motion goes through the local daemon REST API and the app patch's
 ~/.peachy/motion.json. Settings live in ~/.peachy/senses.json; the console pushes
 them (POST /config) and they stay for when the laptop is off.
@@ -61,7 +59,7 @@ DEFAULT_CFG = {
     "doze_body": 0.0, "doze_deg": None, "scan_body": [],
     "light": {"dark_max": 30.0, "lit_min": 70.0, "jump": 35.0},
     "level": None, "sleep_pose": None, "greeting": "Hi! I'm here.", "volume": 100, "voice": "ballad",
-    "wake": False, "wake_model": "hey_peachy.onnx", "wake_threshold": 0.7, "notify_url": "",
+    "wake": False, "wake_model": "vosk-model-small-en-us-0.15", "wake_threshold": 0.6, "notify_url": "",
 }
 CONVO_PKG = Path("/venvs/apps_venv/lib/python3.12/site-packages/reachy_mini_conversation_app")
 
@@ -89,7 +87,6 @@ RELEASE_S = 6.0                   # nobody in view this long: stop following (he
 DRIFT = math.radians(14)          # head moved by someone else this far for DRIFT_S: yield
 DRIFT_S = 0.8
 YIELD_S = 4.0
-VOICE_MIN = math.radians(25)
 SLEEP_S = 2.8
 
 _AXES = ("x", "y", "z", "roll", "pitch", "yaw")
@@ -390,29 +387,51 @@ def greet() -> None:
         note(f"greeting failed: {e}"[:160], False)
 
 
-def wake_by_voice(rel: float | None) -> None:
-    """Into a conversation from asleep, Dozing or an idle Awake, then face the voice."""
-    state = life_state()
-    if state == "semi" and semi_active():
-        wake_from_semi()
-    else:
-        if state == "asleep":
-            daemon("/api/motors/set_mode/enabled", "POST", timeout=10)
-            aim["busy_until"] = time.monotonic() + 30
-            try:
-                turn_body(0.0)          # wake_up ends at body 0, in a move timed for the head
-                daemon("/api/move/play/wake_up", "POST", timeout=30)
-                time.sleep(1.0)
-                wait_moves()
-            finally:
-                aim["busy_until"] = 0.0
-        motion({"mode": "free", "head_pitch": 0.0})
-        start_convo()
-        set_state("awake")
-        greet()
-    if rel is not None and abs(rel) > VOICE_MIN:
-        body = float(robot["state"].get("body_yaw") or 0.0)
-        set_body(clip(body + rel, -BODY_MAX, BODY_MAX))
+def wake_by_voice() -> None:
+    """Into a conversation from asleep, Dozing or an idle Awake: through Dozing, then
+    room watch's look-around; it wakes facing whoever it finds, else the doze direction."""
+    if not (life_state() == "semi" and semi_active()):
+        try:
+            enter_semi()
+        except RuntimeError as e:
+            note(f"no look-around ({e})"[:160], False)
+            wake_plain()
+            return
+    found = done = False
+    watch.scanning = True
+    try:
+        found = watch.look_for_face(lambda: life_state() != "semi" or console_busy())
+        if found is None:
+            note("look-around interrupted")
+        else:
+            if not found:
+                note("nobody in sight — waking facing the room")
+                set_body(float(cfg()["doze_body"]), True)
+            wake_from_semi()
+        done = True
+    finally:
+        watch.scanning = False
+        if not done and not found and life_state() == "semi":
+            motion({"mode": "tucked"})
+            set_body(float(cfg()["doze_body"]))
+
+
+def wake_plain() -> None:
+    """Into a conversation where Peachy stands (no Dozing poses or no app patch)."""
+    if life_state() == "asleep":
+        daemon("/api/motors/set_mode/enabled", "POST", timeout=10)
+        aim["busy_until"] = time.monotonic() + 30
+        try:
+            turn_body(0.0)          # wake_up ends at body 0, in a move timed for the head
+            daemon("/api/move/play/wake_up", "POST", timeout=30)
+            time.sleep(1.0)
+            wait_moves()
+        finally:
+            aim["busy_until"] = 0.0
+    motion({"mode": "free", "head_pitch": 0.0})
+    start_convo()
+    set_state("awake")
+    greet()
 
 
 def wait_moves(max_s: float = 20.0) -> None:
@@ -556,6 +575,16 @@ class Watch:
 
     SETTLE_S = 3.0
     WINDOW_S = 8.0
+    HOLD_S = 3.0
+    STEP_S = 2.0
+    RISE_HOLD_S = 1.0
+
+    @staticmethod
+    def _step(dark: float, th: dict) -> float:
+        """How much a lamp must add to `dark`. Auto-exposure shrinks the step when
+        daylight already lights the room (night 8 → 89, noon 40 → 75), so half the
+        dark level, at least 15, at most the calibrated jump."""
+        return min(float(th["jump"]), max(15.0, 0.5 * dark))
 
     def __init__(self) -> None:
         self.convo = ConvoActivity()
@@ -571,6 +600,7 @@ class Watch:
         self.raw: deque = deque()
         self.smooth: deque = deque()
         self.settled_since = 0.0
+        self.rise_at = self.rise_base = 0.0
         self.away_since = 0.0
         self.parked: float | None = None
         self.history: deque = deque(maxlen=120)
@@ -628,6 +658,7 @@ class Watch:
 
         if self.scanning:
             self.status = "looking"
+            self._reset_light()
             return
         self._health(now, state, own)
         if self._drifted(now, state, own):
@@ -753,6 +784,14 @@ class Watch:
         self.raw.clear()
         self.smooth.clear()
         self.settled_since = 0.0
+        self.rise_at = 0.0
+
+    @staticmethod
+    def _tucked() -> bool:
+        """Head at the calibrated tucked pitch: the light lines only hold for that view."""
+        want = ((cfg().get("sleep_pose") or {}).get("head_pose") or {}).get("pitch")
+        got = (robot["state"].get("head_pose") or {}).get("pitch")
+        return want is None or got is None or abs(float(got) - float(want)) <= math.radians(4)
 
     def _at_doze(self, body: float, doze: float) -> bool:
         """At the doze direction, or where the body stopped short of it last turn."""
@@ -782,6 +821,10 @@ class Watch:
                 act("face the doze direction", lambda: self._park(doze))
             return
         self.away_since = 0.0
+        if not self._tucked():
+            self._reset_light()
+            self.status = "settling"
+            return
         if eyes["luma"] is None or time.monotonic() - eyes["luma_at"] > 1.5:
             self.status = "waiting for camera"
             return
@@ -809,17 +852,35 @@ class Watch:
                 self.level = "lit" if cur >= th["lit_min"] else "dark"
                 log(f"watch: room is {self.level} ({cur:.0f})")
             return
-        if self.level == "dark" and cur >= th["lit_min"]:
-            self.level = "lit"
-            base = min(v for _, v in self.smooth)
-            if cur - base >= th["jump"]:
-                self.note(f"lights on ({base:.0f} → {cur:.0f}) — looking around")
+        lo = min(v for _, v in self.smooth)
+        hi = max(v for _, v in self.smooth)
+        if self.level == "dark":
+            if self.rise_at and cur - self.rise_base < self._step(self.rise_base, th):
+                self.rise_at = 0.0
+            if not self.rise_at:
+                base = min(v for t, v in self.smooth if now - t <= self.STEP_S)
+                if cur - base >= self._step(base, th):
+                    self.rise_at, self.rise_base = now, base
+            if self.rise_at and now - self.rise_at >= self.RISE_HOLD_S:
+                self.level = "lit"
+                self.note(f"lights on ({self.rise_base:.0f} → {cur:.0f}) — looking around")
+                log("watch: lights on, last 3 s: "
+                    + " ".join(f"{v:.0f}" for t, v in self.smooth if now - t <= 3.0))
                 self.start_scan()
-            else:
-                self.note(f"brightened slowly ({base:.0f} → {cur:.0f}) — daylight, staying put")
-        elif self.level == "lit" and cur <= th["dark_max"]:
-            self.level = "dark"
-            self.note(f"lights off ({cur:.0f})")
+            elif not self.rise_at and lo >= th["lit_min"]:
+                self.level = "lit"
+                self.note(f"brightened slowly (now {cur:.0f}) — daylight, staying put")
+        elif self.level == "lit":
+            recent = [v for t, v in self.smooth if now - t <= self.HOLD_S]
+            before = [v for t, v in self.smooth if now - t > self.HOLD_S]
+            if before and max(before) - max(recent) >= self._step(max(recent), th):
+                self.level = "dark"
+                self.note(f"lights off ({max(before):.0f} → {cur:.0f})")
+                log("watch: lights off, last 5 s: "
+                    + " ".join(f"{v:.0f}" for t, v in self.smooth if now - t <= 5.0))
+            elif hi <= th["dark_max"]:
+                self.level = "dark"
+                self.note(f"lights off ({cur:.0f})")
 
     def start_scan(self) -> None:
         if acting():
@@ -841,25 +902,30 @@ class Watch:
             time.sleep(0.1)
         return self._face_seen()
 
+    def look_for_face(self, stop) -> bool | None:
+        """Head up, then the body through scan_body, until two face hits within 1 s.
+        True: found, the body stays there; False: nobody; None: stop() said so.
+        The caller sets self.scanning, which points the eyes at faces."""
+        eyes["hits"].clear()
+        motion({"mode": "lifted"})
+        if self._dwell(1.8):
+            return True
+        for b in cfg()["scan_body"]:
+            if stop():
+                return None
+            set_body(float(b), wait=True)
+            if self._dwell(0.9):
+                return True
+        return False
+
     def _scan(self) -> None:
-        c = cfg()
-        doze = float(c["doze_body"])
+        doze = float(cfg()["doze_body"])
         found = done = False
         try:
-            eyes["hits"].clear()
-            motion({"mode": "lifted"})
-            found = self._dwell(1.8)
-            if not found:
-                for b in c["scan_body"]:
-                    if life_state() != "semi" or console_busy():
-                        self.note("look-around interrupted")
-                        done = True
-                        return
-                    set_body(float(b), wait=True)
-                    if self._dwell(0.9):
-                        found = True
-                        break
-            if found:
+            found = self.look_for_face(lambda: life_state() != "semi" or console_busy())
+            if found is None:
+                self.note("look-around interrupted")
+            elif found:
                 self.note("someone's here — waking up")
                 wake_from_semi()
             else:
@@ -907,7 +973,6 @@ class Ears:
         self.score = 0.0
         self.peak = (0.0, 0.0)
         self.heard_at = 0.0
-        self.voice_rel: float | None = None
 
     def blocked(self) -> str:
         c = cfg()
@@ -970,11 +1035,6 @@ class Ears:
             self._hear(self.det.feed(pcm))
 
     def _hear(self, scores: list[float]) -> None:
-        doa = robot["state"].get("doa") or {}
-        if doa.get("speech_detected") and doa.get("angle") is not None:
-            self.voice_rel = wrap(math.pi / 2 - float(doa["angle"]))
-        elif self.det.hot == 0:
-            self.voice_rel = None
         thr = float(cfg()["wake_threshold"])
         for s in scores:
             self.score = s
@@ -989,11 +1049,9 @@ class Ears:
     def _trigger(self, score: float) -> None:
         self.cooldown_until = time.monotonic() + self.COOLDOWN_S
         self.heard_at = time.time()
-        rel = self.voice_rel
         self._close()
-        where = "" if rel is None else f", voice at {math.degrees(rel):+.0f}°"
-        note(f'heard "Hey Peachy" ({score:.2f}{where}) — waking up')
-        act("wake", lambda: wake_by_voice(rel))
+        note(f'heard "Hey Peachy" ({score:.2f}) — looking for you')
+        act("wake", wake_by_voice)
 
     def snapshot(self) -> dict:
         c = cfg()

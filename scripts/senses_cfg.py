@@ -20,8 +20,8 @@ DOZE_DEG = max(-160.0, min(160.0, float(os.environ.get("PEACHY_DOZE_DEG", "-100"
 DAY = os.environ.get("PEACHY_DAY", "07:00-23:00")
 DOZE_AFTER_S = float(os.environ.get("PEACHY_DOZE_AFTER_S", "180"))
 GREETING = os.environ.get("PEACHY_GREETING", "Hi! I'm here.")
-WAKE_MODEL = os.environ.get("PEACHY_WAKE_MODEL", "hey_peachy.onnx")
-WAKE_THRESHOLD = float(os.environ.get("PEACHY_WAKE_THRESHOLD", "0.7"))
+WAKE_MODEL = os.environ.get("PEACHY_WAKE_MODEL", "vosk-model-small-en-us-0.15")
+WAKE_THRESHOLD = float(os.environ.get("PEACHY_WAKE_THRESHOLD", "0.6"))
 NOTIFY_URL = os.environ.get("PEACHY_NOTIFY_URL", "")   # e.g. https://ntfy.sh/<your topic>; problems go here
 
 
@@ -67,7 +67,7 @@ def scan_path(start: float, step: float = 55.0) -> list[float]:
     return [round(heading.to_world(a)) for a in path]
 
 
-def build(follow: bool, watch: bool, wake: bool = False) -> dict:
+def build(watch: bool, wake: bool = False) -> dict:
     cal = load_state().get("calibration") or {}
     sleep = cal.get("sleep") or {}
     sleep_pose = None
@@ -75,7 +75,7 @@ def build(follow: bool, watch: bool, wake: bool = False) -> dict:
         sleep_pose = {"head_pose": {k: float(v) for k, v in sleep["head_pose"].items()},
                       "antennas": [float(a) for a in sleep["antennas"]][:2]}
     return {
-        "follow": bool(follow), "watch": bool(watch), "day": DAY, "doze_after_s": DOZE_AFTER_S,
+        "follow": False, "watch": bool(watch), "day": DAY, "doze_after_s": DOZE_AFTER_S,
         "doze_body": heading.enc_rad(DOZE_DEG), "doze_deg": DOZE_DEG,
         "scan_body": [heading.enc_rad(w) for w in scan_path(DOZE_DEG)],
         "light": light_thresholds(DOZE_DEG),

@@ -32,6 +32,7 @@ import json
 import math
 import threading
 import time
+import urllib.request
 from collections import deque
 from pathlib import Path
 
@@ -42,7 +43,7 @@ from scipy.spatial.transform import Rotation
 from reachy_mini_conversation_app.console import LocalStream
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
-from reachy_mini_conversation_app.moves import BreathingMove
+from reachy_mini_conversation_app.moves import BreathingMove, MovementManager
 
 _FILE = Path.home() / ".peachy" / "motion.json"
 _YAW_LIMIT = math.radians(160)
@@ -210,16 +211,24 @@ def _blend_head(app_head, held: np.ndarray) -> np.ndarray:
     return out
 
 
-# Face tracking, alt-azimuth. The app's head_tracking tool would turn on the
+# Face tracking, alt-azimuth, on for every conversation (the app's head_tracking
+# tool only turns it off and on again). The app's tool would turn on the
 # daemon's tracker, which at weight 1 discards the app's head target (held body
 # yaw included, so the neck twists when the body turns), rolls with the face,
 # and runs at the lowest priority: 3-4 detections a second on the busy CM4.
 # It stays off. The patch finds faces itself instead, with the same YuNet model
 # at normal priority on the app's own camera frames (~38 ms each, run at
 # _FACE_HZ), and aims: yaw about the vertical, pitch in the head frame, and the
-# body takes over when the head is turned far. Dozing, or the console turning
-# the body, ends tracking and forgets the request, so waking does not bring
-# back one from before.
+# body takes over when the head is turned far. Dozing pauses it and each wake
+# starts it again; the console turning the body stops it until the next wake.
+#
+# Who to look at: while the user talks (the backend's VAD) and Peachy is silent,
+# the mic array's direction of arrival picks the face nearest the voice, and
+# the pick sticks after they stop. The array is a line of four mics in the head:
+# 0 = left, pi/2 = ahead, pi = right, and front and back look alike. Its speech
+# flag also fires on Peachy's own motors (from 0 or pi), hence the VAD gate and
+# the agreement test. A voice with no face near it turns the head (and body)
+# that way, then only a face near it is taken for _SEEK_S.
 _FACE_HZ = 10.0
 _FACE_W = 320
 _FOCAL_N = 1.27            # focal / half image width (cal-heading fit: 405 px at 640)
@@ -234,28 +243,79 @@ _AIM_SMOOTH = 6.0                   # 1/s, head easing toward the aim
 _AIM_BODY_AT = math.radians(18)     # head this far off the body for _AIM_BODY_S...
 _AIM_BODY_S = 0.8
 _AIM_BODY_STEP = math.radians(8)    # ...moves the body up to this much toward it
-_track: dict = {"weight": None, "suspended": False, "body_yaw": None}
+_DOA_URL = "http://127.0.0.1:8000/api/state/doa"
+_VOICE_WINDOW_S = 0.8               # speech directions this recent...
+_VOICE_MIN_N = 4                    # ...at least this many (~0.4 s at _FACE_HZ)...
+_VOICE_SPREAD = math.radians(20)    # ...agreeing this closely make a voice bearing
+_VOICE_MATCH = math.radians(20)     # a face this close to it is the speaker
+_VOICE_STALE_S = 30.0               # a speech_started with no stop after this is ignored
+_SEEK_S = 2.5
+_SEEK_EVERY_S = 3.0
+_track: dict = {"want": True, "suspended": False, "body_yaw": None}
 # az / body: head azimuth and body direction, offsets from the held yaw.
 _aim: dict = {"on": False, "robot": None, "ts": None, "seen": 0.0, "at": 0.0, "off_since": 0.0,
-              "az": 0.0, "taz": 0.0, "pitch": 0.0, "tpitch": 0.0, "body": 0.0, "tbody": 0.0}
+              "az": 0.0, "taz": 0.0, "pitch": 0.0, "tpitch": 0.0, "body": 0.0, "tbody": 0.0,
+              "seek_az": 0.0, "seek_until": 0.0, "seek_at": 0.0}
 _aim_hist: deque = deque(maxlen=120)   # (t, az, pitch), last ~1.2 s
+_voice: dict = {"user": False, "user_since": 0.0, "user_at": 0.0, "peachy": False}
+_doa: deque = deque(maxlen=30)         # (t, bearing): speech-flagged, head frame, +left
 
 
 def _clip(v: float, lim: float) -> float:
     return max(-lim, min(lim, v))
 
 
-def _pick_face(faces, w: int, h: int, prev: tuple[float, float] | None) -> tuple[float, float] | None:
-    """Nose of the face to follow, in [-1, 1] of the image: the one near the last
-    pick if it is still there, else the largest."""
-    if not faces:
+def _bearing(x: float) -> float:
+    """Image x in [-1, 1] (+right) → bearing from the camera axis (+left)."""
+    return -math.atan(x / _FOCAL_N)
+
+
+def _read_doa(now: float) -> None:
+    try:
+        with urllib.request.urlopen(_DOA_URL, timeout=0.3) as r:
+            d = json.loads(r.read() or b"null")
+    except (OSError, ValueError):
+        return
+    if d and d.get("speech_detected") and d.get("angle") is not None:
+        _doa.append((now, math.pi / 2 - float(d["angle"])))
+
+
+def _voice_bearing(now: float) -> tuple[float, float] | None:
+    """(time, bearing) of the user's voice, head frame, or None unless the backend
+    hears the user, Peachy is silent and the recent speech directions agree."""
+    v = _voice
+    talking = v["user"] and now - v["user_since"] < _VOICE_STALE_S
+    if v["peachy"] or not (talking or now - v["user_at"] < 0.3):
         return None
+    s = [(t, a) for t, a in _doa if now - t <= _VOICE_WINDOW_S]
+    if len(s) < _VOICE_MIN_N:
+        return None
+    a = sorted(b for _, b in s)
+    if a[-1] - a[0] > _VOICE_SPREAD:
+        return None
+    return s[len(s) // 2][0], a[len(a) // 2]
+
+
+def _pick_face(faces, w: int, h: int, prev: tuple[float, float] | None,
+               voice: float | None = None, only_voice: bool = False) -> tuple[tuple[float, float] | None, bool]:
+    """(nose of the face to follow in [-1, 1] of the image, picked by the voice):
+    the one nearest the voice bearing if it is close, else (unless only_voice)
+    the one near the last pick if it is still there, else the largest."""
+    if not faces:
+        return None, False
     nose = [(f.nose[0] / max(w - 1, 1) * 2 - 1, f.nose[1] / max(h - 1, 1) * 2 - 1) for f in faces]
+    idx = range(len(faces))
+    if voice is not None:
+        i = min(idx, key=lambda k: abs(_bearing(nose[k][0]) - voice))
+        if abs(_bearing(nose[i][0]) - voice) <= _VOICE_MATCH:
+            return nose[i], True
+    if only_voice:
+        return None, False
     if prev is not None:
-        i = min(range(len(faces)), key=lambda k: (nose[k][0] - prev[0]) ** 2 + (nose[k][1] - prev[1]) ** 2)
+        i = min(idx, key=lambda k: (nose[k][0] - prev[0]) ** 2 + (nose[k][1] - prev[1]) ** 2)
         if abs(nose[i][0] - prev[0]) < 0.36:
-            return nose[i]
-    return nose[max(range(len(faces)), key=lambda k: faces[k].bbox[2] * faces[k].bbox[3])]
+            return nose[i], False
+    return nose[max(idx, key=lambda k: faces[k].bbox[2] * faces[k].bbox[3])], False
 
 
 def _face_loop() -> None:
@@ -274,16 +334,42 @@ def _face_loop() -> None:
                 from reachy_mini.vision.face_detector import FaceDetector
                 det = FaceDetector()
             frame = robot.media.get_frame()
+            _read_doa(time.monotonic())
             if frame is not None:
                 h, w = frame.shape[:2]
                 small = cv2.resize(frame, (_FACE_W, round(_FACE_W * h / w / 2) * 2),
                                    interpolation=cv2.INTER_AREA)
-                prev = _pick_face(det.detect(small), small.shape[1], small.shape[0], prev)
-                if prev is not None:
-                    _aim_see({"detected": True, "x": prev[0], "y": prev[1], "ts": t0})
+                faces = det.detect(small)
+                now = time.monotonic()
+                vb = _voice_bearing(now)
+                with _lock:
+                    az_now = _aim_then(t0)[0]
+                    seeking = now < _aim["seek_until"]
+                    voice = _aim["seek_az"] - az_now if seeking else (
+                        None if vb is None else vb[1] + _aim_then(vb[0])[0] - az_now)
+                face, heard = _pick_face(faces, small.shape[1], small.shape[0], prev, voice, seeking)
+                if face is not None:
+                    prev = face
+                    if heard and seeking:
+                        with _lock:
+                            _aim["seek_until"] = 0.0
+                    _aim_see({"detected": True, "x": face[0], "y": face[1], "ts": t0})
+                elif not seeking:
+                    prev = None
+                if voice is not None and not heard and not seeking and now - _aim["seek_at"] > _SEEK_EVERY_S:
+                    _aim_seek(az_now + voice)
         except Exception:  # noqa: BLE001 - a camera hiccup must not end tracking for good
             time.sleep(1.0)
         time.sleep(max(0.0, 1.0 / _FACE_HZ - (time.monotonic() - t0)))
+
+
+def _aim_seek(az: float) -> None:
+    """Turn toward a voice with no face near it: head azimuth az (offset from the
+    held yaw); the body turns under it."""
+    with _lock:
+        now = time.monotonic()
+        _aim["seek_az"], _aim["seek_until"], _aim["seek_at"] = az, now + _SEEK_S, now
+        _aim["seen"] = now
 
 
 def _aim_then(t: float) -> tuple[float, float]:
@@ -317,6 +403,10 @@ def aim(md: str, h: float) -> tuple[float, float, float]:
         _aim["at"] = now
         if md != "free" or not _aim["on"] or now - _aim["seen"] > _AIM_LOST_S:
             _aim["taz"] = _aim["tpitch"] = _aim["tbody"] = 0.0
+            _aim["off_since"] = _aim["seek_until"] = 0.0
+        elif now < _aim["seek_until"]:
+            _aim["tbody"] = _aim["seek_az"]
+            _aim["taz"] = _aim["body"] + _clip(_aim["seek_az"] - _aim["body"], _AIM_HEAD_MAX)
             _aim["off_since"] = 0.0
         else:
             rel = _aim["taz"] - _aim["body"]
@@ -338,34 +428,30 @@ def aim(md: str, h: float) -> tuple[float, float, float]:
 
 
 def _start_head_tracking(self, weight: float = 1.0) -> None:
-    _track["weight"] = weight
+    _track["want"] = True
     _aim["robot"] = self
-    if not _track["suspended"]:
-        _aim["on"] = True
+    _aim["on"] = not _track["suspended"]
 
 
 def _stop_head_tracking(self) -> None:
-    _track["weight"] = None
+    _track["want"] = False
     _aim["on"] = False
     _orig_stop_tracking(self)
 
 
 def _sync_tracking(robot, md: str) -> None:
+    _aim["robot"] = robot
     body = settings().get("body_yaw")
     if body != _track["body_yaw"]:
-        if _track["body_yaw"] is not None:
-            _track["weight"] = None
-            _aim["on"] = False
+        if _track["body_yaw"] is not None and not _track["suspended"]:
+            _track["want"] = False
         _track["body_yaw"] = body
     suspend = md != "free"
-    if suspend == _track["suspended"]:
-        return
-    _track["suspended"] = suspend
-    if suspend:
-        _track["weight"] = None
-        _aim["on"] = False
-    elif _track["weight"] is not None:
-        _aim["on"] = True
+    if suspend != _track["suspended"]:
+        _track["suspended"] = suspend
+        if not suspend:
+            _track["want"] = True
+    _aim["on"] = _track["want"] and not suspend
 
 
 def _wrap_command(orig):
@@ -452,6 +538,26 @@ if not getattr(ReachyMini, "_peachy_patched", False):
         return float("inf") if s <= 0 or mode() != "free" else max(20.0, s)
 
     ConversationHandler.IDLE_BEHAVIOR_THRESHOLD_S = property(_idle_threshold)
+
+    _orig_mark_activity = ConversationHandler._mark_activity
+
+    def _mark_activity(self, reason: str) -> None:
+        now = time.monotonic()
+        if reason == "user_speech_started":
+            _voice.update(user=True, user_since=now)
+        elif reason == "user_speech_stopped":
+            _voice.update(user=False, user_at=now)
+        _orig_mark_activity(self, reason)
+
+    ConversationHandler._mark_activity = _mark_activity
+
+    _orig_set_speaking = MovementManager.set_speaking
+
+    def _set_speaking(self, speaking: bool) -> None:
+        _voice["peachy"] = bool(speaking)
+        _orig_set_speaking(self, speaking)
+
+    MovementManager.set_speaking = _set_speaking
 
     def _get_muted(self) -> bool:
         return self.__dict__.get("_peachy_muted", False) or mode() != "free"

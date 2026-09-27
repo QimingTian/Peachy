@@ -27,7 +27,7 @@ flowchart LR
     D["Daemon REST :8000"]
     W["WebRTC producer :8443<br/>camera + mic"]
     A["Conversation app<br/>+ Peachy patch"]
-    E["peachy-senses :8767<br/>state + room watch + Follow + Hey Peachy"]
+    E["peachy-senses :8767<br/>state + room watch + Hey Peachy"]
     CFG["~/.peachy/motion.json<br/>fan / PID config"]
   end
   S -- "REST" --> D
@@ -107,12 +107,11 @@ Single page, desktop layout, black/white liquid-glass style.
 | **Header** | Connection status, clocks, System sheet, Stop (abort everything), Shut down. |
 | **Robot** | Asleep / Dozing / Awake. State comes from `.run/reachy_toggle_state.json`. Asleep faces the Dozing direction (`PEACHY_DOZE_DEG`, −100°): the body turns there with the head, then the droop; Awake brings it back to body 0 before `wake_up`, which ends there anyway in a move timed for the head. |
 | **Room watch** | Switch for room watch on the robot: Light on / Light off and the tucked-camera brightness with its dark/lit lines. Its events go to the activity log. |
-| **Follow** | Switch for Follow on the robot (faces). |
-| **Avatar** | Switch: Peachy becomes your avatar. Its head copies yours from the AirPods on this Mac (all three axes), your voice (this Mac's mic) plays on its speaker, its mic plays in your AirPods. Recenter, Set level, live readout. See Avatar. |
+| **Avatar** | Switch: Peachy becomes your avatar. Its head copies yours from the AirPods on this Mac (all three axes), your voice (this Mac's mic) plays on its speaker, its mic plays in your AirPods. Recenter, Set level; a line only when you need to act. See Avatar. |
 | **Hey Peachy** | Switch for the wake word on the robot: Listening, Heard, or why it's paused. |
 | **Microphone** | Live waveform of the mic array output (20 ms peaks, last 6 s), level in dBFS, and the XVF3800 AGC gain / max. The console opens its own audio-only WebRTC stream while the switch is on and closes it 10 s after polling stops. |
 | **Apps** | Installed daemon apps, start/stop; App store (install/remove). |
-| **Centre** | Camera (WebRTC, with face boxes) or live 3D twin; below it the **body direction tape** (click to turn, ±160°); beside it the **head tilt tape** (click to tilt, ±30°, up-positive, while Awake). |
+| **Centre** | Camera (WebRTC) or live 3D twin; below it the **body direction tape** (click to turn, ±160°); beside it the **head tilt tape** (click to tilt, ±30°, up-positive, while Awake). |
 | **Moves** | Peachy expressions, daemon emotions and dances, with search. |
 | **Conversation** | Start/stop the conversation app, mute mic, live transcript. |
 | **Speaker** | Volume + test, and "type text → Play": `ctl-say.py` speaks it on the robot. |
@@ -127,9 +126,8 @@ top of the app's own head motion (so the result wanders a few degrees with it);
 otherwise the head goes there directly. Dozing and waking reset it to 0.
 
 **Alt-azimuth.** Everything Peachy does on its own turns (body + head yaw) and
-tilts (head pitch), and never rolls: Follow, voice turns, room watch, the tapes,
-waking and Dozing poses, and the conversation app's face tracking (the patch
-aims it). Head poses are extrinsic xyz, R = Rz(yaw)·Ry(pitch)·Rx(roll),
+tilts (head pitch), and never rolls: following the speaker in a conversation
+(the patch aims it), room watch, the tapes, waking and Dozing poses. Head poses are extrinsic xyz, R = Rz(yaw)·Ry(pitch)·Rx(roll),
 so holding roll fixed keeps the horizon level (`head_pose.altaz`). Roll and head
 position are home's: 0 unless a home is saved under "Head position on wake".
 Only moves (Peachy expressions, emotions, dances), the conversation app's own
@@ -177,7 +175,7 @@ instead of a restart. It needs the app patch and a pose calibration.
 - **Look around** (`POST /api/doze/pose`, only while Dozing): head `lifted` /
   `tucked` and/or body `yaw_deg`; `wait` returns once the body is there. Room
   watch on the robot writes `motion.json` itself instead.
-- In Dozing Follow stays paused.
+- In Dozing nothing follows faces; waking starts following again.
 - Asleep / Awake from Dozing stop the app first, as usual.
 
 ### Console API (`dashboard/server.py`)
@@ -196,7 +194,7 @@ All routes require the token (cookie, `?k=`, or `X-Peachy-Token` header).
 | Speaker | `POST /api/say`, `POST /api/sound/stop`, `GET/POST /api/volume`, `POST /api/volume/test`, `GET /api/sounds/turret`, `POST /api/sounds/turret/sync` |
 | Conversation | `GET/POST /api/converse/idle-motion`, `.../voices[/current\|/apply]`, `.../personalities[/apply]` |
 | Apps | `GET /api/apps`, `GET /api/apps/store`, `POST /api/apps/{install,stop}`, `POST /api/apps/{start,remove}/{name}`, `GET /api/apps/job/{id}` |
-| Senses | `GET /api/sense`, `POST /api/sense/{follow\|watch\|wake}/{on\|off}` (the robot's routine; see Senses) |
+| Senses | `GET /api/sense`, `POST /api/sense/{watch\|wake}/{on\|off}` (the robot's routine; see Senses) |
 | Avatar | `GET /api/airpods`, `POST /api/airpods/{on\|off\|recenter\|level}` (see Avatar) |
 | Microphone | `GET /api/mic?since=<seq>` (min/max/rms per 20 ms, int16; polling keeps the stream open) |
 | Dozing | `POST /api/doze/pose` |
@@ -218,15 +216,15 @@ All of it runs on the robot: `robot/peachy_senses.py`, the systemd unit
 - **Settings** (`~/.peachy/senses.json`) are built on the laptop by
   `scripts/senses_cfg.py` from its calibration (world heading, head home,
   Dozing and sleep poses, light samples) and pushed by the console whenever
-  they change; the robot keeps the last copy. The console's Follow, Room
-  watch and Hey Peachy switches set `follow` / `watch` / `wake`; Stop and Shut
-  down turn all three off.
+  they change; the robot keeps the last copy. The console's Room watch and
+  Hey Peachy switches set `watch` / `wake`; Stop and Shut down turn both off.
+  `follow` is always sent off (following belongs to the conversation, below).
 - **Holding off**: while the console holds its robot lock (any button that
   moves Peachy) it tells the robot (`/busy`, refreshed every 60 s, 180 s ttl),
-  and room watch, Follow and the wake word pause. Robot events (dozing, lights on, someone
+  and room watch and the wake word pause. Robot events (dozing, lights on, someone
   found, asleep…) are copied into the console's activity log.
 - **Faces**: YuNet on the daemon's camera over IPC, 320 px wide, 10 times a
-  second, only while following or looking around (about 95 ms per frame
+  second, only while looking around (about 95 ms per frame
   including the 1080p resize, roughly 80% of one of the CM4's four cores).
   Otherwise the service idles at about 5% of a core; the camera closes 20 s
   after the last use.
@@ -234,21 +232,30 @@ All of it runs on the robot: `robot/peachy_senses.py`, the systemd unit
   `/busy` need the token from `.run/senses_token` (made by `sense-robot.sh`,
   never committed).
 
-### Follow
+### Following the speaker
 
-Awake with no app running (no conversation, nothing in Dozing), Peachy follows
-the nearest face alt-azimuth through the local daemon (yaw and pitch eased at
-25 Hz, roll and position held at `head_pose.altaz`'s level); the body takes over
-past 18°, and whoever is talking wins when several faces are in view. It
-doesn't turn toward voices: the mic array flags Peachy's own motor noise as
-speech, from straight left or right (direction of arrival 0 or π), so each
-turn set off the next. Losing the
-face holds the pose; after 6 s it lets go where it is. It pauses when motors are
-off, an app or move is running, the console is acting, or someone else moves the
-head (4 s).
+There is no Follow switch. While a conversation runs (Awake, the patched app),
+Peachy follows whoever is talking without being asked; Awake with no app it
+doesn't follow anyone. The app patch runs YuNet on the app's camera frames and
+aims head and body alt-azimuth (see `app-patch.sh`). Who is talking comes from
+the mic array's direction of arrival (`GET /api/state/doa`), counted only while
+the app's voice detection says you are speaking and Peachy isn't: the last
+0.8 s must hold at least 4 readings within 20°, which drops the motor noise the
+chip flags as speech from straight left or right.
 
-While the conversation app runs, its `head_tracking` tool is handled by the app
-patch instead (see `app-patch.sh`).
+- **Several faces**: the one within 20° of the voice; with no usable voice,
+  the one it was following, else the largest.
+- **Voice off camera**: if the voice holds a direction no face is at, Peachy
+  turns there (head, then body) and looks for 2.5 s, taking only a face near
+  the voice, at most every 3 s. Nobody there: back to the held direction.
+- **Losing everyone**: after 4 s it eases back to the held direction.
+- The app's `head_tracking` tool ("stop looking at me") still turns it off;
+  turning the body from the console turns it off too, and Dozing pauses it.
+  The next conversation starts with it on.
+
+The array is 4 mics in a line across the head, so it only tells angles across
+180° in front (left to right, relative to the head), a person behind reads as
+one in front, and two people less than about 20° apart can't be told apart.
 
 ### Room watch
 
@@ -260,10 +267,16 @@ patch instead (see `app-patch.sh`).
 - **Lights on**: brightness is the mean luma of the tucked camera view (camera
   over IPC; within 2% of the WebRTC view the samples were taken from, after 2 s
   of auto-exposure), only measured with the body at the doze direction and 3 s
-  after it settles. At or below `dark_max` is dark, at or above `lit_min` is
-  lit, and in between keeps the last call. A dark→lit change counts only if it
-  rose by `jump` within 8 s. A lamp does that in under a second; daylight
-  through the window is far slower. The thresholds come from the `dark` and
+  after it settles, and only with the head at the calibrated tucked pitch
+  (±4°; a look-around starts the call afresh). Lights on is a step up within
+  2 s that holds for 1 s (a lamp does it in one frame; daylight through the
+  window is far slower), lights off a step down that holds for 3 s. The step is half the darker level, at least 15 and at
+  most `jump`: with daylight in the room auto-exposure shrinks what the lamp
+  adds (night 8 → 89, noon 40 → 75). The room with the lamp off reads anywhere
+  from 8 to 40 depending on the daylight, so the absolute lines only decide the
+  first call (at or above `lit_min` is lit, else dark) and slow changes: a
+  whole 8 s at or above `lit_min` is lit (daylight, no look-around), at or
+  below `dark_max` is dark. The thresholds come from the `dark` and
   `lit` samples in `.run/light_samples/` nearest the doze direction
   (`cal-light.py`), falling back to 30 / 70 / 35.
 - **Look around**: head up, then the body steps through `scan_path` (to the far
@@ -283,9 +296,8 @@ patch instead (see `app-patch.sh`).
 - **Keeping it right**: every loop compares the state with the one the time of
   day wants (Dozing by day, asleep by night) and fixes it, retrying a failed
   change after 60 s. A state set by hand (Console, wake word) is held until the
-  next day/night change. Awake with no app, no face in the last 2 s and nobody
-  using the Console for `PEACHY_DOZE_AFTER_S` dozes by day and sleeps by night.
-  Awake or Dozing with motors off for 10 s and no app becomes asleep (the
+  next day/night change. Awake with no app and nobody using the Console for
+  `PEACHY_DOZE_AFTER_S` dozes by day and sleeps by night. Awake or Dozing with motors off for 10 s and no app becomes asleep (the
   daemon's idle reset got there first).
 - **Health**: Dozing is refused while the conversation app patch is missing
   (an app update removes it; rerun `scripts/app-patch.sh`), and asleep is used
@@ -297,53 +309,41 @@ patch instead (see `app-patch.sh`).
 ### Hey Peachy
 
 "Hey Peachy" (or "Hi Peachy") wakes Peachy into a conversation from asleep,
-Dozing, or Awake with no app, then turns the body toward the voice (mic
-direction of arrival). From asleep it plays the wake-up move first. It listens
+Dozing, or Awake with no app. It goes through Dozing (app started, head tucked,
+body at the doze direction), then looks for you the way room watch does when
+the lights come on: head up, then the body steps through `scan_path`. It wakes
+facing the first face it finds, with the greeting; if it finds nobody it wakes
+facing the doze direction. It doesn't turn toward the voice: the mic's
+direction of arrival is too unreliable. Without the app patch or the Dozing
+poses it just wakes where it stands (from asleep, with the wake-up move). It listens
 only while nothing else has the robot and after 4 s of that, so it never hears
 Peachy's own voice, sounds or moves; during a conversation, an app, a move, a
 look-around or a console action the mic is closed and nothing runs. The robot's
 own speaker output is removed by the mic array's echo canceller anyway.
 
-- **Detector**: openWakeWord's three ONNX models (melspectrogram → Google speech
-  embedding → the `hey_peachy.onnx` classifier), run by `robot/peachy_wake.py`
-  (`~/.peachy/wake.py`) on the shared ALSA capture device (`dsnoop`, 16 kHz), so
-  it runs alongside the conversation app. One 80 ms frame at or over
-  `wake_threshold` (0.7) triggers it (the score peaks for about one frame);
-  then 8 s cooldown.
-- **Cost**: the speech embedding is most of it (about 18 ms per 80 ms frame on
-  the CM4), so it only runs while the room isn't quiet: a frame louder than 3×
-  the 300–3400 Hz noise floor switches the models on for 2 s, first rebuilding
-  the last 0.9 s from the raw audio so the start of the phrase isn't lost. In a
-  quiet room that is about 4% of one core; while people talk about 25%.
-- **Model**: `robot/models/hey_peachy.onnx`, trained with openWakeWord's
-  automatic training on synthetic Piper voices (see "Training the wake word").
+- **Detector**: the small offline Vosk English recogniser
+  (`vosk-model-small-en-us-0.15`, 40 MB, trained on real speech) limited to
+  about 30 words: "peachy", hey / hi / hello / okay, and near misses such as
+  "Petey", "Richie", "peach", "pizza" so they have somewhere to go. Run by
+  `robot/peachy_wake.py` (`~/.peachy/wake.py`) on the shared ALSA capture
+  device (`dsnoop`, 16 kHz), so it runs alongside the conversation app. A hit
+  is "peachy" right after hey / hi / hello / okay, or at the start of an
+  utterance, with confidence at or over `wake_threshold` (0.6); then 8 s
+  cooldown. Vosk is pip-installed into `~/.peachy/pylib`, not the app venv.
+- **Cost**: the recogniser only runs while the room isn't quiet: a chunk
+  louder than 3x the 300-3400 Hz noise floor switches it on for 1.5 s, with
+  0.5 s of audio from before so the start of the phrase isn't lost. In a quiet
+  room it is next to nothing; while people talk about 20-25% of one core.
+- **How it does**: macOS voices it never saw, 36 of 40 clips (only the
+  novelty voice Albert is missed); 5 of 200 near-miss clips ("hey Petey",
+  "that's peachy"); 6 h of room audio, ESC-50 and AudioSet (lots of speech),
+  none. Played from a laptop next to the robot and heard through its mic,
+  it caught every clip in the part of the recording without the robot talking.
 
-### Training the wake word
-
-The model was trained on the laptop (M-series Mac, a few hours, most of it
-generating and augmenting clips; the training itself takes 5 minutes) outside
-the repo, in `~/peachy-train`, with openWakeWord's `train.py`:
-
-- Positives: 25,000 Piper (`en_US-libritts_r-medium`) clips of "hey peachie" /
-  "hi peachie" — espeak reads "peachy" as /piːki/, the `-ie` spelling gives
-  /piːtʃi/ — plus 6,000 with a pause ("hey, peachie", "hey peachie!").
-  Negatives: 25,000 clips of phonetically close phrases, plus 8,000 hard
-  negatives as their own class ("hey peach", "hey Petey", "hey Reachy" as both
-  /ɹiːki/ and /ɹiːtʃi/, "peaches", "hey Richie", other assistants' wake words).
-  `train.py` alone mixes such a list into the 25,000 texts round-robin, so each
-  phrase lands in about one clip and "hey peach" still woke it.
-- Augmentation: MIT impulse responses, ESC-50, two AudioSet shards, and 10
-  minutes recorded through the robot's own mic in its room.
-- Negative features: openWakeWord's precomputed ACAV100M set (~2,000 h, 17 GB)
-  and its 11 h validation set for the false-positive rate.
-- Local fixes in a wrapper: Piper on the GPU (MPS, TorchScript fusion off),
-  adversarial phrases built from "peachy" (the DeepPhonemizer download for
-  out-of-dictionary words is gone), and fork instead of spawn for the training
-  data loader on macOS.
-- Checked with macOS voices (a TTS engine it never saw) and a real recording:
-  a person saying "Hi Peachy" scores 0.99; about half of the macOS voice clips
-  trigger it (voices like Albert or Ralph never do); 5 of 252 near-miss clips
-  do ("hey Petey", "that's peachy"); 7 minutes of room audio, none.
+A custom openWakeWord model was tried first (synthetic Piper voices, hard
+negatives, three rounds). It scored well on clean clips but through the
+robot's mic it caught 3 of 40, so it was dropped; the training setup is still
+in `~/peachy-train` outside the repo.
 
 `./scripts/sense-robot.sh status` shows the live state; `log` shows its journal.
 
@@ -367,7 +367,7 @@ python scripts/ctl-avatar.py          # q or Ctrl-C to stop; --no-audio = head o
   apps. It moves nothing: it holds the daemon's app slot (with no app running,
   the daemon puts the robot to sleep 1.5 s after the last app stops), turns
   the motors on, marks Peachy awake and keeps peachy-senses `/busy` set, so
-  room watch, Follow and the wake word stay paused. It does not create a
+  room watch and the wake word stay paused. It does not create a
   `ReachyMini`: that one's `no_media` mode makes the daemon release the camera
   and audio, which ends the daemon's WebRTC and with it the avatar's audio.
 - **Start**: `ctl-avatar.py` stops the running app and starts `peachy_avatar`
@@ -387,22 +387,22 @@ python scripts/ctl-avatar.py          # q or Ctrl-C to stop; --no-audio = head o
   input, `--volume` sets Peachy's mic on this Mac. With the Mac speakers as
   output instead of AirPods, the two mics feed back.
 - **Stop**: the head glides home, the app stops, and Peachy stays Awake with
-  the head at home, so Follow takes over. The daemon would put it to sleep
+  the head at home. The daemon would put it to sleep
   1.5 s after the app exits, but any message on its WebRTC data channel calls
   that off, so the audio link sends `get_version` every 0.2 s from before the
   stop until 2 s after it returns (`--no-audio` still opens the link, silent).
   A LAN session never takes the app slot, so this holds nothing. If the link
   is down, the daemon's sleep goes ahead and the console shows Asleep.
 
-**Console**: the Avatar switch (under Follow) runs `ctl-avatar.py
+**Console**: the Avatar switch (under Room watch) runs `ctl-avatar.py
 --status-file .run/airpods_status.json` (output in `.run/airpods.log`). While
 it is on, the session holds the console's robot lock, so every other motion
 control is greyed out. Stop and Shut down end it too. **Recenter** makes the
 way you face now straight ahead (SIGUSR1); **Set level** calibrates the buds'
-tilt (SIGUSR2, see Mapping). The card shows what is sent (head yaw relative to
-the body, pitch, roll), the body, the AirPods→send rates, sample age,
-transport and the audio link. On start the console ends a session left over
-from a console that went away.
+tilt (SIGUSR2, see Mapping). The card shows a line only when you need to act
+(waiting for AirPods, AirPods out, the Set level countdown, an audio error);
+the numbers are in `.run/airpods_status.json`. On start the console ends a
+session left over from a console that went away.
 
 ## AirPods head follow
 
@@ -457,8 +457,8 @@ python scripts/ctl-airpods.py             # follow (--stop-app stops a running a
   `POST /api/move/set_target` if the socket fails.
 - **Safety**: it refuses to run while an app is running (the conversation app
   streams its own head targets) unless `--stop-app`. It glides the head home
-  first, and keeps peachy-senses `/busy` set (every 5 s, 20 s ttl) so Follow
-  and room watch pause. With the AirPods out (or disconnected) it holds for
+  first, and keeps peachy-senses `/busy` set (every 5 s, 20 s ttl) so room
+  watch and the wake word pause. With the AirPods out (or disconnected) it holds for
   2 s, then glides home; putting them back recenters. The start, recenter,
   resume and reconnect blend in over 0.6 s. If the daemon keeps reporting a
   stopped app as `stopping` (its process already gone), it notes that and
@@ -486,8 +486,8 @@ so:
 | Tool | What it changes | Survives |
 |---|---|---|
 | `scripts/tool-body-pid.sh apply` | Turntable PID 200/0/0 → 300/50/0 (stock stops 10–15° short). Needs a full `systemctl restart`; REST `/api/daemon/restart` does not reload it. | Reverted by a daemon/firmware update — re-apply |
-| `scripts/app-patch.sh apply` | Installs `peachy_patch.py` into the conversation app: holds the body yaw from `~/.peachy/motion.json` (the stock app streams body=0° at 100 Hz), adds the console's head tilt (`head_pitch`), scales breathing, sets the idle-behaviour interval, holds the Dozing poses (`mode` = `free` / `tucked` / `lifted`; Dozing turns face tracking off and forgets the request), aims the app's face tracking alt-azimuth (the daemon tracker stays off; while the app's `head_tracking` tool is on, the patch runs YuNet itself on the app's camera frames, 320 px wide, 10 times a second at normal priority, about 40-55 ms per frame on the CM4; it turns the head by yaw and pitch and the body follows past 18°; turning the body from the console or Dozing ends it), makes `conversation.say` safe to call over `/rpc`, and overrides the mic chip settings the app writes at start: `mic_ns` (XVF3800 `PP_MIN_NS`, default 0.15 instead of the stock 0.8 — suppresses the room's air-conditioning hum) and `agc_max` (`PP_AGCMAXGAIN`, default 10). `set breath_scale=… idle_every_s=… body_yaw_deg=… mic_ns=… agc_max=…` edits the settings (mic ones apply on the next app start). | Reverted by an app update — re-apply |
-| `scripts/sense-robot.sh install` | Installs `robot/peachy_senses.py` as the systemd unit `peachy-senses` (apps venv, normal priority): state, room watch, Follow and the wake word on the robot (see Senses), with `robot/peachy_wake.py`, `robot/models/*.onnx` and openWakeWord's two feature models (downloaded once into `.run/models/oww`), plus the token in `.run/senses_token`. Replaces the older `peachy-follow` unit. `status`, `log`, `uninstall`. | Survives reboots and app updates |
+| `scripts/app-patch.sh apply` | Installs `peachy_patch.py` into the conversation app: holds the body yaw from `~/.peachy/motion.json` (the stock app streams body=0° at 100 Hz), adds the console's head tilt (`head_pitch`), scales breathing, sets the idle-behaviour interval, holds the Dozing poses (`mode` = `free` / `tucked` / `lifted`; Dozing mutes the mic and pauses following), follows the speaker for the whole conversation (the daemon tracker stays off; the patch runs YuNet itself on the app's camera frames, 320 px wide, 10 times a second at normal priority, about 40-55 ms per frame on the CM4, picks the face by the mic's direction of arrival while you speak, turns toward a voice off camera, turns the head by yaw and pitch and the body past 18°; the app's `head_tracking` tool or turning the body from the console stops it, Dozing pauses it; see Following the speaker), makes `conversation.say` safe to call over `/rpc`, and overrides the mic chip settings the app writes at start: `mic_ns` (XVF3800 `PP_MIN_NS`, default 0.15 instead of the stock 0.8 — suppresses the room's air-conditioning hum) and `agc_max` (`PP_AGCMAXGAIN`, default 10). `set breath_scale=… idle_every_s=… body_yaw_deg=… mic_ns=… agc_max=…` edits the settings (mic ones apply on the next app start). | Reverted by an app update — re-apply |
+| `scripts/sense-robot.sh install` | Installs `robot/peachy_senses.py` as the systemd unit `peachy-senses` (apps venv, normal priority): state, room watch and the wake word on the robot (see Senses), with `robot/peachy_wake.py`, the Vosk model (downloaded once into `.run/models`) and `vosk` pip-installed into `~/.peachy/pylib`, plus the token in `.run/senses_token`. Replaces the older `peachy-follow` unit. `status`, `log`, `uninstall`. | Survives reboots and app updates |
 | `scripts/tool-fan.sh` | CM4 fan trip point (calm / steady / restore). | — |
 
 Without the app patch, a body turn from the console has to stop the
@@ -503,7 +503,7 @@ Filenames are `tag-verb`, so `ls scripts/` groups itself.
 |---|---|---|
 | `ctl-` | `ctl-toggle.py` (sleep / wake / toggle / calibrate / status), `ctl-express.py` (expressions: yes, no, curious, lookaround, excited, shy, stretch), `ctl-say.py` (text → macOS `say` → robot speaker), `ctl-body-yaw.py` (body-yaw test CLI), `ctl-airpods.py` (head follows your AirPods: `--probe`, `--dry-run`, `--stop-app`), `ctl-avatar.py` (Peachy as your avatar: head + two-way audio; `--no-audio`, `--mic`, `--volume`) | direct control |
 | `avatar-` | `avatar-robot.sh` (+ `robot/peachy_avatar`) | installs the avatar's robot app (`status`, `install`, `uninstall`) |
-| `sense-` | `sense-robot.sh` (+ `senses_cfg.py`, `robot/peachy_senses.py`, `robot/peachy_wake.py`) | installs state, room watch, Follow and the wake word on the robot; the settings pushed to it |
+| `sense-` | `sense-robot.sh` (+ `senses_cfg.py`, `robot/peachy_senses.py`, `robot/peachy_wake.py`) | installs state, room watch and the wake word on the robot; the settings pushed to it |
 | `cam-` | `cam-snap.py` | one camera frame over WebRTC (`--open`) |
 | `cal-` | `cal-head.py`, `cal-light.py`, `cal-heading.py` | neutral head offset (type `save` in the REPL or it doesn't persist); labelled light samples in the Dozing pose (`capture dark\|lit --sweep`, `list`); world heading from the camera (`capture [--fresh [--zero]]`, `anchor [--dry-run]`, `refit`, `status`; `heading.py` is the shared lib) |
 | `mic-` | `mic-record.py` | record the mic to `.run/mic/<label>.wav` + stats (levels, bands, tonal peaks, 300–3400 Hz SNR, AGC gain); `--compare noise speech-2m` |
@@ -542,7 +542,7 @@ Filenames are `tag-verb`, so `ls scripts/` groups itself.
    also rolls the head with the face, and its detector runs at the lowest
    priority, 3-4 times a second (weight 0 stops it altogether). Peachy doesn't
    use it: the app patch (during a conversation) and `peachy-senses`
-   (otherwise) run the same YuNet detector on the robot at normal priority.
+   (room watch's look-around) run the same YuNet detector on the robot at normal priority.
 10. **Stock `conversation.say` drops the session.** The `/rpc` server runs on
     its own event loop and awaits the session websocket from there. The patch
     runs `say` on the session's loop.
@@ -601,8 +601,8 @@ Set in the environment or `.run/reachy.env` (written by `net-connect.sh`).
 | `PEACHY_DOZE_DEG` | `-100` | body direction while Dozing (clockwise-positive); room watch's light samples are taken here |
 | `PEACHY_DOZE_AFTER_S` | `180` | room watch: seconds without user speech (conversation) or anyone around (Awake) before dozing (night: sleeping) |
 | `PEACHY_NOTIFY_URL` | (empty) | room watch failures are POSTed here as text, e.g. an ntfy.sh topic |
-| `PEACHY_WAKE_MODEL` | `hey_peachy.onnx` | wake word model in `~/.peachy/models` on the robot |
-| `PEACHY_WAKE_THRESHOLD` | `0.7` | wake word score needed (one 80 ms frame) |
+| `PEACHY_WAKE_MODEL` | `vosk-model-small-en-us-0.15` | Vosk model folder in `~/.peachy/models` on the robot |
+| `PEACHY_WAKE_THRESHOLD` | `0.6` | recogniser confidence needed for "peachy" |
 
 `.run/` holds the token, calibration, host cache, logs and models. It is
 git-ignored and must never be shared.

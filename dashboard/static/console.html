@@ -204,9 +204,7 @@ canvas.scope{height:72px}
 .twin .twin-canvas{position:absolute;inset:0;width:100%!important;height:100%!important;cursor:grab}
 .twin .twin-canvas:active{cursor:grabbing}
 .screen.view-3d .twin{display:block}
-.screen.view-3d video,.screen.view-3d img,.screen.view-3d .reticle,.screen.view-3d .faces{display:none!important}
-.faces{position:absolute;inset:0;pointer-events:none}
-.faces i{position:absolute;border:1.5px solid var(--peach);border-radius:2px;transform:translate(-50%,-50%);width:26px;height:26px;opacity:.85}
+.screen.view-3d video,.screen.view-3d img,.screen.view-3d .reticle{display:none!important}
 .bar .seg{flex:none}
 .bar .seg button{padding:0 14px}
 .corner{position:absolute;width:18px;height:18px;border:0 solid rgba(255,255,255,.45);pointer-events:none}
@@ -442,29 +440,13 @@ dialog .actions{justify-content:flex-end;margin-top:20px}
 
     <section class="block">
       <div class="row-head">
-        <h2>Follow</h2>
-        <button class="switch" id="fwSwitch" role="switch" aria-checked="false" aria-label="Follow faces and voices" data-need="robot"></button>
-      </div>
-      <div class="light-read">
-        <span class="lamp" id="fwLamp"></span>
-        <b id="fwTxt">Off</b>
-      </div>
-    </section>
-
-    <section class="block">
-      <div class="row-head">
         <h2>Avatar</h2>
         <button class="switch" id="apSwitch" role="switch" aria-checked="false" aria-label="Peachy as your avatar: head follows your AirPods, your voice on its speaker, its ears in your AirPods" data-need="robot"></button>
       </div>
-      <div class="light-read">
-        <span class="lamp" id="apLamp"></span>
-        <b id="apTxt">Off</b>
-        <span class="mono" id="apNums"></span>
-      </div>
+      <div class="light-read" id="apRead" hidden><b id="apTxt"></b></div>
       <div class="row" id="apRow" hidden>
         <button class="btn sm" id="apCenter" data-need="robot" title="Face where Peachy should look straight ahead, then press">Recenter</button>
         <button class="btn sm quiet" id="apLevel" data-need="robot" title="Press, then within 3 s look level at the horizon and hold for 1 s — measures how the AirPods sit in your ears (saved)">Set level</button>
-        <span class="dim" id="apInfo"></span>
       </div>
     </section>
 
@@ -504,7 +486,6 @@ dialog .actions{justify-content:flex-end;margin-top:20px}
       <div class="screen" id="screen">
         <video id="video" playsinline muted></video>
         <div class="twin" id="twin"></div>
-        <div class="faces" id="faces"></div>
         <div class="empty" id="feedEmpty"><p class="t" id="emptyT">Camera off</p></div>
         <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
         <div class="reticle"></div>
@@ -909,7 +890,7 @@ const rtc=new PeachyRTC($("#video"),{onState:(state,detail)=>{
   S.camState=state; S.live=state==="live";
   if(state==="error") notice(detail||"Camera failed","err");
   else if(state==="live") notice("Camera on","ok");
-  liveUi(); renderFeedEmpty(); drawFaces();
+  liveUi(); renderFeedEmpty();
 }});
 
 function setView(v){
@@ -919,7 +900,7 @@ function setView(v){
   $("#feedInfo").textContent=""; $("#feedWarn").textContent="";
   if(v==="3d") ensureTwin().then(syncTwin);
   else syncTwin();
-  renderFeedEmpty(); liveUi(); drawFaces();
+  renderFeedEmpty(); liveUi();
 }
 $("#view").addEventListener("click",e=>{const b=e.target.closest("button[data-v]"); if(b&&b.dataset.v!==S.view) setView(b.dataset.v);});
 let twinLoading=null;
@@ -1015,19 +996,7 @@ const PAUSED={asleep:"Asleep",conversation:"Conversation running",app:"App runni
   offline:"Robot offline","motors off":"Motors off","no daemon state":"Robot offline",yielding:"Paused",starting:"Starting",
   acting:"Busy",looking:"Looking around",cooldown:"Waking up","no model":"No wake word model on the robot"};
 function renderSense(s){
-  s=s||{}; const live=s.live||{}, f=live.follow;
-  $("#fwSwitch").setAttribute("aria-checked",s.follow?"true":"false");
-  let txt="Off", lamp="";
-  if(s.follow){
-    const st=(f&&f.status)||"";
-    if(!s.running) txt="Robot senses offline";
-    else if(!f) {txt="Starting";lamp="idle";}
-    else if(st==="tracking"){txt=f.faces>1?`Tracking 1 of ${f.faces}`:"Tracking";lamp="track";}
-    else if(st==="watching"||st==="waiting"){txt="Looking";lamp="idle";}
-    else if(st.startsWith("paused:")) txt=PAUSED[st.slice(7)]||"Paused";
-    else txt=humanize(st);
-  }
-  $("#fwTxt").textContent=txt; $("#fwLamp").className="lamp"+(lamp?" "+lamp:"");
+  s=s||{};
   renderWake(s);
   renderWatch(s);
 }
@@ -1047,18 +1016,10 @@ function renderWake(s){
   }
   $("#wkTxt").textContent=txt; $("#wkLamp").className="lamp"+(lamp?" "+lamp:"");
 }
-function drawFaces(){
-  const box=$("#faces"), f=S.sense&&S.sense.live&&S.sense.live.follow;
-  if(!S.live||S.view!=="camera"||!f||!f.target){box.innerHTML="";return;}
-  const v=$("#video"), r=v.getBoundingClientRect();
-  const vw=v.videoWidth||16, vh=v.videoHeight||9, k=Math.min(r.width/vw,r.height/vh);
-  const dw=vw*k, dh=vh*k, [W,H]=f.size||[640,360];
-  box.innerHTML=`<i style="left:${(r.width-dw)/2+f.target[0]/W*dw}px;top:${(r.height-dh)/2+f.target[1]/H*dh}px"></i>`;
-}
 async function pollSense(){
   const d=await api("/api/sense",{timeout:8000});
   if(d.ok===false) return;
-  S.sense=d; renderSense(d); drawFaces();
+  S.sense=d; renderSense(d);
 }
 async function toggleSense(feature,sw){
   const on=sw.getAttribute("aria-checked")==="true";
@@ -1067,28 +1028,20 @@ async function toggleSense(feature,sw){
   if(d.ok===false) notice(lastLine(d.msg)||"Didn’t start","err");
   pollSense(); pollLog();
 }
-const AP_TXT={following:"Following your head","no AirPods":"Waiting for AirPods","AirPods connecting":"Connecting",
-  "AirPods gone, holding":"AirPods out — holding","AirPods gone, home":"AirPods out — head home",paused:"Paused",
-  stopping:"Gliding home",starting:"Starting",leveling:"Hold level…"};
-const sdeg=v=>(v<0?"−":"+")+Math.abs(v).toFixed(0)+"°";
+const AP_ACT={"no AirPods":"Waiting for AirPods","AirPods gone, holding":"AirPods out — holding",
+  "AirPods gone, home":"AirPods out — head home",leveling:"Hold level…"};
 function renderAirpods(a){
   a=a||{}; const l=a.live||{}, st=l.status||"starting";
   $("#apSwitch").setAttribute("aria-checked",a.on?"true":"false");
   $("#apRow").hidden=!a.on;
-  let txt="Off", lamp="", nums="", info="";
+  let txt="";
   if(a.on){
     const lv=/^level in (\d+)/.exec(st);
-    txt=lv?`Look level at the horizon — ${lv[1]}`:(AP_TXT[st]||humanize(st));
-    lamp=st==="following"?"track":"idle";
-    const h=l.head;
-    if(h&&st==="following") nums=`yaw ${sdeg(h.yaw)} pitch ${sdeg(h.pitch)} roll ${sdeg(h.roll)}`;
-    if(h&&Math.abs(h.body)>=1) info=`body ${sdeg(h.body)} · `;
-    if(l.hz_in!=null) info+=`${l.hz_in}→${l.hz_out} Hz · ${l.age_ms??"—"} ms · ${l.via||""}`;
-    if(l.level) info+=(l.level.pitch||l.level.roll)?` · level ${sdeg(l.level.pitch)}/${sdeg(l.level.roll)}`:" · level not set";
-    if(l.audio) info+=l.audio==="error"?` · audio: ${l.audio_err||"error"}`:` · audio ${l.audio}`;
+    if(lv) txt=`Look level at the horizon — ${lv[1]}`;
+    else if(AP_ACT[st]) txt=AP_ACT[st];
+    else if(l.audio==="error") txt=`Audio: ${l.audio_err||"error"}`;
   } else if(a.err) txt=a.err;
-  $("#apTxt").textContent=txt; $("#apLamp").className="lamp"+(lamp?" "+lamp:"");
-  $("#apNums").textContent=nums; $("#apInfo").textContent=info;
+  $("#apTxt").textContent=txt; $("#apRead").hidden=!txt;
 }
 async function pollAirpods(){
   const d=await api("/api/airpods",{timeout:4000});
@@ -1114,7 +1067,6 @@ $("#apLevel").addEventListener("click",async()=>{
   notice(d.ok===false?lastLine(d.msg)||"Set level failed":"Look up: level at the horizon in 3 s, hold 1 s",d.ok===false?"err":"ok");
   pollAirpods();
 });
-$("#fwSwitch").addEventListener("click",()=>toggleSense("follow",$("#fwSwitch")));
 $("#rwSwitch").addEventListener("click",()=>toggleSense("watch",$("#rwSwitch")));
 $("#wkSwitch").addEventListener("click",()=>toggleSense("wake",$("#wkSwitch")));
 
@@ -1842,9 +1794,9 @@ every(15000,pollFan);
 every(3000,()=>{ if(S.st&&S.st.daemon){ loadBody(); loadHead(); } if(S.sheet) loadHeading(); });
 setTimeout(()=>{loadConvLists();loadSounds();loadVolume();loadApps();loadMoves();},300);
 every(30000,()=>{ if(S.st&&S.st.daemon) loadApps(); });
-setInterval(()=>{ const s=S.sense; if(!document.hidden&&s&&(s.follow||s.watch||s.wake)) pollSense(); },1000);
+setInterval(()=>{ const s=S.sense; if(!document.hidden&&s&&(s.watch||s.wake)) pollSense(); },1000);
 setInterval(()=>{ const a=S.st&&S.st.airpods; if(!document.hidden&&a&&a.on) pollAirpods(); },250);
-window.addEventListener("resize",()=>{drawSpark();drawMic();drawFaces();});
+window.addEventListener("resize",()=>{drawSpark();drawMic();});
 </script>
 </body>
 </html>

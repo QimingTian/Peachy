@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Wake word on the robot: openWakeWord's three ONNX models, streaming.
+"""Wake word on the robot: a small offline speech recogniser (Vosk) limited to a
+handful of words, so "Hey Peachy" is picked out of whatever is said.
 
 Audio comes from the shared ALSA capture device (dsnoop, 16 kHz stereo S16),
 so it runs next to the conversation app without taking the mic away.
-Every 80 ms: melspectrogram over the last 1760 samples, one speech embedding
-over the last 76 mel frames, then the wake word classifier over the last
-16 embeddings. That's the same streaming path as openwakeword.Model.
+In a quiet room nothing is recognised: a chunk louder than LOUD x the noise
+floor turns the recogniser on for HOT_S (with PREROLL_S of audio from before,
+so the start of the phrase isn't lost), and when it goes quiet again the
+utterance is closed and the recogniser reset.
 
-  python3 wake.py --bench            # print scores and CPU use for 20 s
+A hit is the word "peachy" right after hey / hi / hello / okay, or at the start
+of an utterance, with the recogniser's confidence as the score. The near-miss
+words in WORDS are there so "Hey Petey" or "Hey Richie" have somewhere to go.
+
+  python3 wake.py --bench            # print what it hears and CPU use for 20 s
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -23,16 +31,15 @@ import numpy as np
 RATE = 16000
 CHUNK = 1280
 DEVICE = "reachymini_audio_src"
-MODELS = Path(os.environ.get("PEACHY_WAKE_DIR", Path.home() / ".peachy" / "models"))
+HOME = Path(os.environ.get("PEACHY_HOME", Path.home() / ".peachy"))
+MODELS = Path(os.environ.get("PEACHY_WAKE_DIR", HOME / "models"))
+sys.path.insert(0, str(HOME / "pylib"))
 
-
-def _session(path: Path):
-    import onnxruntime as ort
-    opts = ort.SessionOptions()
-    opts.inter_op_num_threads = 1
-    opts.intra_op_num_threads = 1
-    opts.log_severity_level = 3
-    return ort.InferenceSession(str(path), sess_options=opts, providers=["CPUExecutionProvider"])
+LEAD = {"hey", "hi", "hello", "okay"}
+WORDS = ["peachy", "hey", "hi", "hello", "okay",
+         "peach", "peaches", "preachy", "itchy", "pete", "petey", "peter", "patty", "patchy", "petty",
+         "pizza", "piece", "peace", "pitch", "richie", "reach",
+         "each", "speech", "feature", "creature", "keychain", "jarvis", "siri", "buddy", "baby"]
 
 
 def voice_rms(pcm: np.ndarray) -> float:
@@ -43,52 +50,44 @@ def voice_rms(pcm: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.fft.irfft(spec, pcm.size) ** 2)))
 
 
-class Detector:
-    """Feed int16 mono chunks; returns the wake word score for each 80 ms.
+def score(result: dict) -> float:
+    """Confidence of a "Hey Peachy" in one recogniser result, else 0."""
+    words = result.get("result", [])
+    best = 0.0
+    for k, w in enumerate(words):
+        if w["word"] == "peachy" and (k == 0 or words[k - 1]["word"] in LEAD):
+            best = max(best, float(w["conf"]))
+    return best
 
-    The speech embedding is most of the cost, so in a quiet room it is skipped:
-    a chunk louder than LOUD x the noise floor turns the models on for HOT_S,
-    first rebuilding the mel frames and the last BACKFILL embeddings from the
-    raw audio so the start of the phrase isn't lost. While quiet the classifier
-    input keeps the last (quiet) embeddings, which is what it would see anyway.
-    """
+
+class Detector:
+    """Feed int16 mono chunks; returns a score whenever an utterance ends
+    (and 0.0 for chunks that end nothing). `heard` is the last utterance."""
 
     LOUD = 3.0
     MIN_RMS = 60.0
-    HOT_S = 2.0
-    BACKFILL = 3
+    HOT_S = 1.5
+    PREROLL_S = 0.5
 
     def __init__(self, model: str, gate: bool = True):
-        self.mel = _session(MODELS / "melspectrogram.onnx")
-        self.emb = _session(MODELS / "embedding_model.onnx")
-        self.ww = _session(MODELS / model)
-        self.ww_in = self.ww.get_inputs()[0].name
-        self.frames = self.ww.get_inputs()[0].shape[1]
+        import vosk
+        vosk.SetLogLevel(-1)
+        self.vosk = vosk
+        self.model = vosk.Model(str(MODELS / model))
         self.gate = gate
         self.reset()
 
     def reset(self) -> None:
-        self.ring = np.zeros((76 + 8 * (self.BACKFILL - 1) + 3) * 160, np.int16)
+        self.rec = self.vosk.KaldiRecognizer(self.model, RATE, json.dumps(WORDS + ["[unk]"]))
+        self.rec.SetWords(True)
         self.pending = np.zeros(0, np.int16)
-        self.mels = np.ones((76, 32), np.float32)
-        self.feats = deque(maxlen=self.frames)
-        noise = np.random.randint(-1000, 1000, RATE * 4).astype(np.int16)
-        spec = self._mel(noise)
-        for i in range(0, spec.shape[0] - 75, 8):
-            self.feats.append(self._embed(spec[i:i + 76]))
-        self.warm = 5
+        self.pre = deque(maxlen=max(1, round(self.PREROLL_S * RATE / CHUNK)))
         self.floor = self.MIN_RMS
         self.level = 0.0
         self.hot = 0
-        self.cold = True
+        self.open = False
+        self.heard = ""
         self.ran = self.skipped = 0
-
-    def _mel(self, pcm: np.ndarray) -> np.ndarray:
-        out = self.mel.run(None, {"input": pcm[None].astype(np.float32)})[0]
-        return np.squeeze(out) / 10 + 2
-
-    def _embed(self, window: np.ndarray) -> np.ndarray:
-        return self.emb.run(None, {"input_1": window[None, :, :, None].astype(np.float32)})[0].reshape(-1)
 
     def feed(self, pcm: np.ndarray) -> list[float]:
         scores = []
@@ -97,29 +96,34 @@ class Detector:
         self.pending = buf[n:]
         for i in range(0, n, CHUNK):
             chunk = buf[i:i + CHUNK]
-            self.ring = np.concatenate((self.ring[CHUNK:], chunk))
             if self.gate and not self._hot(chunk):
-                self.cold = True
+                self.pre.append(chunk)
                 self.skipped += 1
-                scores.append(0.0)
+                scores.append(self._close() if self.open else 0.0)
                 continue
             self.ran += 1
-            if self.cold:
-                self.cold = False
-                spec = self._mel(self.ring)
-                for k in range(self.BACKFILL - 1, 0, -1):
-                    self.feats.append(self._embed(spec[len(spec) - 76 - 8 * k:len(spec) - 8 * k]))
-                self.mels = spec[-76:]
+            if not self.open:
+                self.open = True
+                for c in self.pre:
+                    self.rec.AcceptWaveform(c.tobytes())
+                self.pre.clear()
+            if self.rec.AcceptWaveform(chunk.tobytes()):
+                scores.append(self._result(self.rec.Result()))
             else:
-                self.mels = np.vstack((self.mels, self._mel(self.ring[-(CHUNK + 480):])))[-76:]
-            self.feats.append(self._embed(self.mels))
-            x = np.array(self.feats, np.float32)[None]
-            s = float(np.squeeze(self.ww.run(None, {self.ww_in: x})[0]))
-            if self.warm:
-                self.warm -= 1
-                s = 0.0
-            scores.append(s)
+                scores.append(0.0)
         return scores
+
+    def _close(self) -> float:
+        self.open = False
+        s = self._result(self.rec.FinalResult())
+        self.rec.Reset()
+        return s
+
+    def _result(self, text: str) -> float:
+        r = json.loads(text)
+        if r.get("text"):
+            self.heard = r["text"]
+        return score(r)
 
     def _hot(self, chunk: np.ndarray) -> bool:
         rms = voice_rms(chunk)
@@ -163,7 +167,7 @@ def _bench(model: str, seconds: float, gate: bool) -> None:
     det = Detector(model, gate)
     mic = Mic()
     t0, c0 = time.time(), time.process_time()
-    best, n = 0.0, 0
+    heard = ""
     try:
         while time.time() - t0 < seconds:
             pcm = mic.read()
@@ -171,23 +175,22 @@ def _bench(model: str, seconds: float, gate: bool) -> None:
                 print("mic closed")
                 return
             for s in det.feed(pcm):
-                n += 1
-                best = max(best, s)
-                if s > 0.3:
-                    print(f"{time.time() - t0:5.1f}s score {s:.2f}", flush=True)
+                if det.heard != heard or s:
+                    heard = det.heard
+                    print(f"{time.time() - t0:5.1f}s {heard!r} score {s:.2f}", flush=True)
     finally:
         mic.close()
     wall, cpu = time.time() - t0, time.process_time() - c0
-    print(f"{n} frames in {wall:.1f}s ({det.ran} run, {det.skipped} skipped), best {best:.2f}, "
-          f"floor {det.floor:.0f}, CPU {100 * cpu / wall:.1f}% of one core")
+    print(f"{wall:.1f}s ({det.ran} chunks run, {det.skipped} skipped), floor {det.floor:.0f}, "
+          f"CPU {100 * cpu / wall:.1f}% of one core")
 
 
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bench", action="store_true")
-    ap.add_argument("--model", default="hey_jarvis_v0.1.onnx")
+    ap.add_argument("--model", default="vosk-model-small-en-us-0.15")
     ap.add_argument("--seconds", type=float, default=20)
-    ap.add_argument("--no-gate", action="store_true", help="run the models on every chunk")
+    ap.add_argument("--no-gate", action="store_true", help="recognise every chunk")
     a = ap.parse_args()
     _bench(a.model, a.seconds, not a.no_gate)

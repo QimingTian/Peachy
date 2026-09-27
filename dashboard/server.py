@@ -1282,11 +1282,11 @@ def snap() -> JSONResponse:
 
 @app.post("/api/abort")
 def abort_action() -> JSONResponse:
-    """Emergency halt — stop moves, background apps, Follow, room watch and the wake word;
+    """Emergency halt — stop moves, background apps, room watch and the wake word;
     robot stays put."""
     airpods = _airpods_stop()
     if any(_sense_cfg().values()):
-        _sense_set(follow=False, watch=False, wake=False)
+        _sense_set(watch=False, wake=False)
     ok, m = _stop_services(sleep=False)
     if airpods:
         m = f"avatar ended · {m}"
@@ -1304,7 +1304,7 @@ def shutdown_action() -> JSONResponse:
     try:
         t0 = time.time()
         if any(_sense_cfg().values()):
-            _sense_set(follow=False, watch=False, wake=False)
+            _sense_set(watch=False, wake=False)
         ok, m = _stop_services(sleep=True)
         _logrec("shutdown", ok, f"({time.time()-t0:.1f}s) {m}")
         _last.update(action="shutdown", ok=ok, msg=m, at=time.time())
@@ -2078,12 +2078,14 @@ def apps_stop() -> JSONResponse:
 
 
 # -------------------------------------------------------------------- senses
-# State, room watch, Follow and the wake word run on the robot (robot/peachy_senses.py,
+# State, room watch and the wake word run on the robot (robot/peachy_senses.py,
 # systemd unit peachy-senses, scripts/sense-robot.sh) and keep going with the laptop off.
 # The console pushes its settings, reports its own state changes, holds the robot
 # off while it acts (see _RobotLock), and copies the robot's events into the log.
+# Following faces belongs to the conversation (peachy_patch.py), so senses' own
+# Follow is always sent off.
 _SENSE_CFG = _RUN / "sense_config.json"
-_SENSE_FEATURES = ("follow", "watch", "wake")
+_SENSE_FEATURES = ("watch", "wake")
 _SENSES_PORT = 8767
 _SENSES_TOKEN = _RUN / "senses_token"
 _senses: dict = {"status": None, "at": 0.0, "down_until": 0.0, "seen": None, "sent": None, "sent_at": 0.0}
@@ -2164,6 +2166,7 @@ def _senses_watch() -> None:
                 want = None
             robot_cfg = st.get("cfg") or {}
             if want is not None and (want != _senses["sent"]
+                                     or robot_cfg.get("follow")
                                      or any(robot_cfg.get(k) != c[k] for k in _SENSE_FEATURES)):
                 if time.time() - _senses["sent_at"] > 10:
                     _senses_push(c)
@@ -2189,8 +2192,7 @@ def _sense_summary() -> dict:
     st = _senses_status()
     live: dict = {}
     if st:
-        live = {"follow": st.get("follow") if cfg["follow"] else None,
-                "watch": st.get("watch") if cfg["watch"] else None,
+        live = {"watch": st.get("watch") if cfg["watch"] else None,
                 "wake": st.get("wake") if cfg["wake"] else None,
                 "camera": st.get("camera"), "acting": st.get("acting"), "cpu": st.get("cpu")}
     return {**cfg, "running": st is not None, "live": live}
